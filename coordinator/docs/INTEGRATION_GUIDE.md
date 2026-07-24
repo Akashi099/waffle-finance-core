@@ -154,6 +154,8 @@ Returns the serialized order including:
 
 Cursor-based pagination is recommended for new integrations.
 
+Note: Order history responses may be cached for a short time (default 60s). Cursor-based pagination is preferred for consistency; offset pagination is supported for backwards compatibility but may return slightly stale results and is less efficient for large datasets.
+
 ### Example
 
 ```

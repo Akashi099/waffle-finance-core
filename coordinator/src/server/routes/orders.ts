@@ -96,7 +96,8 @@ export function ordersRoutes(orders: OrderService, log?: Logger, abuseDetector?:
       return;
     }
     const address = parsedAddress.data;
-    const limit = Math.min(Number(req.query.limit ?? 50), 200);
+    const rawLimit = Number(req.query.limit ?? 50);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 200) : 50;
 
     // Support both cursor-based (preferred) and offset-based (legacy) pagination
     const cursorParam = req.query.cursor as string | undefined;
