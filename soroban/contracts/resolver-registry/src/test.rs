@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use crate::{
-    Error, ResolverRegistry, ResolverRegistryClient,
+    Error, ResolverLifecycle, ResolverRegistry, ResolverRegistryClient,
     MIN_UNBONDING_PERIOD_SECS,
 };
 use soroban_sdk::{
@@ -498,6 +498,31 @@ fn withdraw_stake_without_request_unregister_fails() {
         registry.try_withdraw_stake(&r).err().unwrap().unwrap(),
         Error::UnbondingNotRequested.into()
     );
+}
+
+#[test]
+fn lifecycle_state_tracks_active_unbonding_and_inactive() {
+    let env = Env::default();
+    let min_stake = 100_0000000i128;
+    let (_, _, _, sac, _, registry) = setup_full(&env, min_stake);
+
+    let r = Address::generate(&env);
+    sac.mint(&r, &min_stake);
+    registry.register(&r, &min_stake);
+
+    let info = registry.get(&r).unwrap();
+    assert_eq!(info.lifecycle, ResolverLifecycle::Active);
+    assert!(registry.is_active(&r));
+
+    registry.request_unregister(&r);
+    let unbonding = registry.get(&r).unwrap();
+    assert_eq!(unbonding.lifecycle, ResolverLifecycle::Unbonding);
+    assert!(!registry.is_active(&r));
+
+    registry.slash(&r, &min_stake);
+    let slashed = registry.get(&r).unwrap();
+    assert_eq!(slashed.lifecycle, ResolverLifecycle::Inactive);
+    assert!(!registry.is_active(&r));
 }
 
 #[test]

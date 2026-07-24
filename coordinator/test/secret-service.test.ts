@@ -341,6 +341,35 @@ describe("SecretService: encryption ENABLED", () => {
   });
 });
 
+describe("SecretService: key rotation support", () => {
+  it("uses the latest key for new writes while still decrypting legacy rows", async () => {
+    const db = await freshDb();
+    const repo = new OrdersRepository(db);
+    const orders = new OrderService(repo, log);
+
+    const legacySecrets = new SecretService(orders, log, VALID_KEY_HEX);
+    const { preimage, hashlock } = makePreimage();
+    const legacyPublicId = await seedOrder(orders, hashlock);
+    await legacySecrets.reveal(legacyPublicId, preimage, "0xtxhash");
+
+    const rotatedSecrets = new SecretService(orders, log, {
+      current: WRONG_KEY_HEX,
+      previous: VALID_KEY_HEX,
+    } as any);
+
+    expect(await rotatedSecrets.get(legacyPublicId)).toBe(preimage);
+
+    const { preimage: nextPreimage, hashlock: nextHashlock } = makePreimage();
+    const nextPublicId = await seedOrder(orders, nextHashlock);
+    await rotatedSecrets.reveal(nextPublicId, nextPreimage, "0xtxhash");
+
+    const row = await repo.findByPublicId(nextPublicId);
+    expect(row?.preimageEncVersion).toBe(1);
+    expect(row?.preimage).not.toBe(nextPreimage);
+    expect(await rotatedSecrets.get(nextPublicId)).toBe(nextPreimage);
+  });
+});
+
 describe("SecretService: plaintext fallback (encryption enabled, legacy row)", () => {
   it("returns a plaintext row transparently when a key is configured", async () => {
     const db = await freshDb();
