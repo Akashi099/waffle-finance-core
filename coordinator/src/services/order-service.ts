@@ -72,7 +72,24 @@ export class OrderService {
   }
 
   history(address: string, limit?: number, offset?: number): Promise<OrderRow[]> {
-    return this.repo.findByAddress(address, limit, offset);
+    const finalLimit = Math.min(Math.max(limit ?? 50, 1), 200);
+    const finalOffset = Math.max(offset ?? 0, 0);
+
+    // Use cache for offset-based pages as well by encoding offset into the cursor string
+    const cursorForCache = `offset:${finalOffset}`;
+    const cached = this.historyCache.get(address, finalLimit, cursorForCache);
+    if (cached) {
+      this.log.debug({ address, limit: finalLimit, offset: finalOffset }, "Cache hit for offset history request");
+      return Promise.resolve(cached.orders);
+    }
+
+    return this.repo.findByAddress(address, finalLimit, finalOffset).then((rows) => {
+      if (rows.length > 0) {
+        // store a synthetic OrderHistoryResult for uniformity
+        this.historyCache.set(address, finalLimit, cursorForCache, { orders: rows, nextCursor: null });
+      }
+      return rows;
+    });
   }
 
   /**
@@ -80,20 +97,25 @@ export class OrderService {
    * More efficient and consistent than offset pagination for large datasets.
    */
   async historyWithCursor(address: string, limit = 50, cursor?: string): Promise<OrderHistoryResult> {
-    // Check cache first
-    const cached = this.historyCache.get(address, limit, cursor);
+    // Enforce sane limits at service boundary
+    const finalLimit = Math.min(Math.max(limit, 1), 200);
+
+    // Check cache first (cache key uses finalLimit)
+    const cached = this.historyCache.get(address, finalLimit, cursor);
     if (cached) {
-      this.log.debug({ address, limit, cursor: cursor || 'first' }, "Cache hit for history request");
+      this.log.debug({ address, limit: finalLimit, cursor: cursor || 'first' }, "Cache hit for history request");
       return cached;
     }
 
     // Cache miss - fetch from database
-    this.log.debug({ address, limit, cursor: cursor || 'first' }, "Cache miss for history request");
-    const result = await this.repo.findByAddressWithCursor(address, limit, cursor);
-    
-    // Cache the result
-    this.historyCache.set(address, limit, cursor, result);
-    
+    this.log.debug({ address, limit: finalLimit, cursor: cursor || 'first' }, "Cache miss for history request");
+    const result = await this.repo.findByAddressWithCursor(address, finalLimit, cursor);
+
+    // Cache the result (only cache non-empty pages to avoid caching many empty results)
+    if (result.orders.length > 0) {
+      this.historyCache.set(address, finalLimit, cursor, result);
+    }
+
     return result;
   }
 
