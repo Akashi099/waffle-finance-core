@@ -221,6 +221,22 @@ async function main(): Promise<void> {
   const reconciler = new Reconciler(cfg, orders, log);
   const staleCleanup = new StaleCleanupService(repo, log);
 
+  // Defined before createApp so the reference is valid when injected.
+  const runExpiryScan = async (): Promise<{ expiredCount: number }> => {
+    try {
+      const expiredCount = await orders.expireStaleOrders();
+      expiryScanRuns.inc({ result: "success" });
+      ordersExpiredTotal.inc(expiredCount);
+      expiryScanLastRun.set(Math.floor(Date.now() / 1000));
+      if (expiredCount > 0) log.info({ count: expiredCount }, "expired stale orders by timelock");
+      return { expiredCount };
+    } catch (err) {
+      expiryScanRuns.inc({ result: "failure" });
+      log.warn({ err }, "order expiry scan failed");
+      throw err;
+    }
+  };
+
   const app = createApp({
     log,
     corsOrigin: cfg.corsOrigin,
