@@ -542,6 +542,27 @@ export class OrdersRepository {
     );
   }
 
+  /**
+   * Reactivate a previously-archived order by clearing its `archived_at`
+   * timestamp.  Only affects rows where `archived_at IS NOT NULL` so it is
+   * safe to call on an already-live order (no-op).
+   *
+   * Used by the archival recovery path when an on-chain lock event is
+   * discovered for an order that was soft-deleted during stale cleanup.
+   */
+  async unarchiveOrder(publicId: string): Promise<void> {
+    await this.run(
+      this.db.prepare(`
+        UPDATE orders
+        SET archived_at = NULL,
+            updated_at  = CAST(strftime('%s','now') AS INTEGER)
+        WHERE public_id = ?
+          AND archived_at IS NOT NULL
+      `),
+      publicId
+    );
+  }
+
   async getLastProcessedBlock(chain: Chain): Promise<number> {
     const srcRow = await this.get<{ max_block: number | null }>(
       this.db.prepare("SELECT MAX(src_lock_block) AS max_block FROM orders WHERE src_chain = ?"),

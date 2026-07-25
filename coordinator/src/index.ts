@@ -11,6 +11,8 @@ import { SorobanListener } from "./listeners/soroban-listener.js";
 import { SolanaListener } from "./listeners/solana-listener.js";
 import { Reconciler } from "./reconciliation/reconciler.js";
 import { StaleCleanupService } from "./services/stale-cleanup.js";
+import { ArchivalPolicy } from "./archival/archival-policy.js";
+import { BacklogScheduler, Priority } from "./backlog/backlog-scheduler.js";
 import { createReadinessChecks } from "./readiness.js";
 import type { StartupPhase } from "./readiness.js";
 import { retryAsync } from "./retry.js";
@@ -220,6 +222,12 @@ async function main(): Promise<void> {
 
   const reconciler = new Reconciler(cfg, orders, log);
   const staleCleanup = new StaleCleanupService(repo, log);
+  const archivalPolicy = new ArchivalPolicy(repo, log);
+
+  // ── Backlog scheduler ────────────────────────────────────────────────────
+  // Central dispatcher that enforces the deterministic priority contract:
+  //   LIVE_EVENT > REPLAY_JOB > SECRET_RECOVERY > STALE_CLEANUP
+  const backlog = new BacklogScheduler(log);
 
   const app = createApp({
     log,
@@ -246,33 +254,67 @@ async function main(): Promise<void> {
   });
 
   // ── 6. Background intervals ─────────────────────────────────────────────
-  void reconciler.run().then(() => {
-    // Transition to "ready" once the first reconciliation pass completes.
-    // This is the signal to orchestration systems (e.g. Kubernetes readinessProbe)
-    // that the coordinator is fully operational.
-    startupPhase = "ready";
-    log.info("first reconciliation complete — coordinator is READY");
-  }).catch((err) => {
+  //
+  // All periodic work is routed through the BacklogScheduler so the priority
+  // contract is enforced even when multiple interval callbacks fire at the
+  // same time.  The scheduler drains its queue on each tick in strict order:
+  //   LIVE_EVENT > REPLAY_JOB > SECRET_RECOVERY > STALE_CLEANUP
+
+  // First reconciliation: enqueue as a REPLAY_JOB so it runs before any
+  // stale-cleanup work but yields to any live events the listeners enqueue.
+  void backlog.enqueue({
+    name: "reconciler:startup",
+    priority: Priority.REPLAY_JOB,
+    execute: async () => {
+      await reconciler.run();
+      startupPhase = "ready";
+      log.info("first reconciliation complete — coordinator is READY");
+    },
+  });
+  void backlog.run().catch((err) => {
     log.warn({ err }, "first reconciliation run failed — staying in pending state");
   });
-  const reconcileInterval = setInterval(
-    () => void reconciler.run(),
-    cfg.pollIntervalMs * 4
-  );
 
+  // Periodic reconciliation: every pollIntervalMs × 4 (default ~60 s)
+  const reconcileInterval = setInterval(() => {
+    backlog.enqueue({
+      name: "reconciler:periodic",
+      priority: Priority.REPLAY_JOB,
+      execute: () => reconciler.run(),
+    });
+    void backlog.run();
+  }, cfg.pollIntervalMs * 4);
+
+  // Expiry scan: every pollIntervalMs × 4 (default ~60 s)
   const runExpiry = (): void => {
-    orders
-      .expireStaleOrders()
-      .then((n) => {
+    backlog.enqueue({
+      name: "expiry-scan",
+      priority: Priority.REPLAY_JOB,
+      execute: async () => {
+        const n = await orders.expireStaleOrders();
         if (n > 0) log.info({ count: n }, "expired stale orders by timelock");
-      })
-      .catch((err) => log.warn({ err }, "order expiry scan failed"));
+      },
+    });
+    void backlog.run();
   };
   void runExpiry();
   const expiryInterval = setInterval(runExpiry, cfg.pollIntervalMs * 4);
 
+  // Stale-order archival: every pollIntervalMs × 240 (default ~60 min)
+  // Routed as STALE_CLEANUP — lowest priority.  Both old StaleCleanupService
+  // and the new ArchivalPolicy run here so the metrics for each are preserved.
   const runStaleCleanup = (): void => {
-    staleCleanup.run().catch((err) => log.warn({ err }, "stale order cleanup failed"));
+    backlog.enqueue({
+      name: "stale-cleanup",
+      priority: Priority.STALE_CLEANUP,
+      execute: () => staleCleanup.run().then(() => undefined),
+    });
+    backlog.enqueue({
+      name: "archival-policy",
+      priority: Priority.STALE_CLEANUP,
+      execute: () => archivalPolicy.runArchival().then(() => undefined),
+    });
+    void backlog.run();
   };
   const staleCleanupInterval = setInterval(runStaleCleanup, cfg.pollIntervalMs * 240);
 
