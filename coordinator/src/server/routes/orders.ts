@@ -13,10 +13,20 @@ import { validationError, orderValidationError, notFoundError, invalidCursorErro
 
 function serialiseOrder(order: OrderRow | null) {
   if (!order) return null;
+  // `expired` is a soft, non-terminal state: the timelock has passed but no
+  // on-chain refund has been confirmed yet.  Clients may still initiate a
+  // refund — flag this explicitly so UIs can show "Expired — Refund Available"
+  // rather than a locked/disabled state.
+  const isRefundable =
+    order.status === "expired" ||
+    order.status === "src_locked" ||
+    order.status === "dst_locked";
+
   return {
     id: order.publicId,
     direction: order.direction,
     status: order.status,
+    isRefundable,
     hashlock: order.hashlock,
     src: {
       chain: order.srcChain,
@@ -96,7 +106,8 @@ export function ordersRoutes(orders: OrderService, log?: Logger, abuseDetector?:
       return;
     }
     const address = parsedAddress.data;
-    const limit = Math.min(Number(req.query.limit ?? 50), 200);
+    const rawLimit = Number(req.query.limit ?? 50);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 200) : 50;
 
     // Support both cursor-based (preferred) and offset-based (legacy) pagination
     const cursorParam = req.query.cursor as string | undefined;

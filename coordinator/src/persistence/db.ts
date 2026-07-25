@@ -214,7 +214,7 @@ export class PostgresStatement {
  * added.  Startup validation compares the database's highest recorded
  * migration against this constant and aborts if they differ.
  */
-export const CURRENT_SCHEMA_VERSION = "006_stale_cleanup.sql";
+export const CURRENT_SCHEMA_VERSION = "007_audit_log.sql";
 
 /**
  * Canonical SQLite migration sequence, in application order.
@@ -233,6 +233,7 @@ const SQLITE_MIGRATIONS = [
   "005_cursor_pagination.sql",
   "005_schema_migrations.sql",
   "006_stale_cleanup.sql",
+  "007_audit_log.sql",
 ] as const;
 
 /**
@@ -251,6 +252,7 @@ const POSTGRES_MIGRATION_FILES = [
   "005_cursor_pagination.sql",
   "005_schema_migrations.sql",
   "006_stale_cleanup_postgres.sql",
+  "007_audit_log_postgres.sql",
 ] as const;
 
 // ── Public helpers ────────────────────────────────────────────────────────────

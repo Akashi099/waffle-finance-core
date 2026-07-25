@@ -10,15 +10,19 @@ import { ordersRoutes } from "./routes/orders.js";
 import { secretsRoutes } from "./routes/secrets.js";
 import { quotesRoutes } from "./routes/quotes.js";
 import { adminRoutes } from "./routes/admin.js";
+import { auditRoutes } from "./routes/audit.js";
 import type { OrderService } from "../services/order-service.js";
 import type { SecretService } from "../services/secret-service.js";
 import type { QuoteService } from "../services/quote-service.js";
 import type { ReconciliationStatus } from "../reconciliation/reconciler.js";
 import type { StaleCleanupResult } from "../services/stale-cleanup.js";
+import type { ExpiryResult } from "./routes/admin.js";
 import { requestIdMiddleware, REQUEST_ID_HEADER } from "./middleware/request-id.js";
 import { AbuseDetector } from "./middleware/abuse-detection.js";
 import { sanitizeForLog } from "../utils/sanitize-for-log.js";
 import { SecretRevealError } from "../services/secret-errors.js";
+import type { AuditRepository } from "../audit/audit-repo.js";
+import { AuditExporter } from "../audit/audit-exporter.js";
 
 export interface AppDeps {
   log: Logger;
@@ -26,6 +30,8 @@ export interface AppDeps {
   orders: OrderService;
   secrets: SecretService;
   quotes: QuoteService;
+  /** Optional — when provided, the audit replay endpoints are mounted. */
+  auditRepo?: AuditRepository;
   getReconciliationStatus?: () => ReconciliationStatus;
   getReadinessChecks?: ReadinessCheckProvider;
   /**
@@ -40,6 +46,12 @@ export interface AppDeps {
    * Omitting this disables the endpoint (the route is not mounted).
    */
   runStaleCleanup?: () => Promise<StaleCleanupResult>;
+  /**
+   * When provided, `POST /admin/expire-now` will trigger an immediate
+   * order-expiry scan and return the count of newly-expired orders.
+   * Omitting this disables the endpoint (the route is not mounted).
+   */
+  runExpiry?: () => Promise<ExpiryResult>;
 }
 
 export function createApp(deps: AppDeps): Express {
@@ -109,9 +121,16 @@ export function createApp(deps: AppDeps): Express {
       adminRoutes({
         log: deps.log,
         runReconcile: deps.runReconcile,
-        runStaleCleanup: deps.runStaleCleanup
+        runStaleCleanup: deps.runStaleCleanup,
+        runExpiry: deps.runExpiry,
       })
     );
+  }
+
+  // Audit replay endpoints — only mounted when an AuditRepository is injected.
+  if (deps.auditRepo) {
+    const exporter = new AuditExporter(deps.auditRepo);
+    app.use("/api", auditRoutes(deps.auditRepo, exporter, deps.log));
   }
 
   // Final error handler - never leak a stack trace to clients.

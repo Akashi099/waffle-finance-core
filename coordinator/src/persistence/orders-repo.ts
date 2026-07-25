@@ -543,25 +543,24 @@ export class OrdersRepository {
   }
 
   /**
-   * Return up to `limit` non-terminal, non-archived orders ordered by
-   * most recently updated.  Used by the CacheVerifier to select a sample
-   * of active orders for snapshot comparison against on-chain state.
+   * Reactivate a previously-archived order by clearing its `archived_at`
+   * timestamp.  Only affects rows where `archived_at IS NOT NULL` so it is
+   * safe to call on an already-live order (no-op).
    *
-   * Terminal statuses (completed, refunded, failed) are excluded because
-   * their on-chain state is immutable and will always agree with the cache.
+   * Used by the archival recovery path when an on-chain lock event is
+   * discovered for an order that was soft-deleted during stale cleanup.
    */
-  async findNonTerminalSample(limit: number): Promise<OrderRow[]> {
-    const rows = await this.all<OrderDbRow>(
+  async unarchiveOrder(publicId: string): Promise<void> {
+    await this.run(
       this.db.prepare(`
-        SELECT * FROM orders
-        WHERE status NOT IN ('completed', 'refunded', 'failed')
-          AND archived_at IS NULL
-        ORDER BY updated_at DESC
-        LIMIT ?
+        UPDATE orders
+        SET archived_at = NULL,
+            updated_at  = CAST(strftime('%s','now') AS INTEGER)
+        WHERE public_id = ?
+          AND archived_at IS NOT NULL
       `),
-      limit
+      publicId
     );
-    return rows.map(rowToOrder);
   }
 
   async getLastProcessedBlock(chain: Chain): Promise<number> {

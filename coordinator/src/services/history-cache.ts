@@ -74,10 +74,13 @@ export class HistoryCache {
    * Store result in cache
    */
   set(address: string, limit: number, cursor: string | undefined, result: OrderHistoryResult): void {
-    // Don't cache if at max size (simple eviction strategy)
+    // If cache is full, evict the oldest entry (simple LRU approximation using insertion order)
     if (this.cache.size >= this.maxSize) {
-      this.log.debug({ cacheSize: this.cache.size }, "Cache at max size, not caching new entry");
-      return;
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey) {
+        this.cache.delete(oldestKey);
+        this.log.debug({ evictedKey: oldestKey }, "Evicted oldest cache entry to make room");
+      }
     }
 
     const key = this.makeCacheKey(address, limit, cursor);

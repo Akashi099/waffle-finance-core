@@ -2,6 +2,16 @@ import { createHash } from "node:crypto";
 import type { Logger } from "pino";
 import { keccak256, toHex } from "viem";
 import { OrderValidationError, type OrderService } from "./order-service.js";
+
+export interface SecretStorageKeyConfig {
+  current?: string;
+  primary?: string;
+  previous?: string | string[];
+  fallback?: string | string[];
+  additional?: string | string[];
+}
+
+export type SecretStorageKeyInput = string | SecretStorageKeyConfig;
 import {
   deriveKey,
   encryptSecret,
@@ -52,18 +62,25 @@ function keccak256Hex(buf: Buffer): string {
  * not set `SECRET_STORAGE_KEY`.
  */
 export class SecretService {
-  /** 32-byte AES key or undefined when encryption is disabled. */
-  private readonly encKey: Buffer | undefined;
+  /** Ordered key ring used for decryption and writes. */
+  private readonly encKeys: Buffer[];
+  private readonly writeKey: Buffer | undefined;
 
   constructor(
     private readonly orders: OrderService,
     private readonly log: Logger,
-    secretStorageKey?: string
+    secretStorageKey?: SecretStorageKeyInput
   ) {
-    if (secretStorageKey) {
+    const configuredKeys = SecretService.normalizeKeys(secretStorageKey);
+
+    if (configuredKeys.length > 0) {
       try {
-        this.encKey = deriveKey(secretStorageKey);
-        this.log.info("SecretService: preimage encryption at rest ENABLED (AES-256-GCM)");
+        this.encKeys = configuredKeys.map((value) => deriveKey(value));
+        this.writeKey = this.encKeys[0];
+        this.log.info(
+          { keyCount: this.encKeys.length },
+          "SecretService: preimage encryption at rest ENABLED (AES-256-GCM)"
+        );
       } catch (err) {
         // Fail fast at startup — a bad key config must never silently fall
         // back to plaintext; that would make it hard to detect misconfiguration.
@@ -72,12 +89,46 @@ export class SecretService {
         );
       }
     } else {
+      this.encKeys = [];
+      this.writeKey = undefined;
       this.log.warn(
         "SecretService: SECRET_STORAGE_KEY is not set. " +
         "Preimages will be stored as PLAINTEXT. " +
         "Set SECRET_STORAGE_KEY to enable encryption at rest."
       );
     }
+  }
+
+  private static normalizeKeys(secretStorageKey?: SecretStorageKeyInput): string[] {
+    if (!secretStorageKey) {
+      return [];
+    }
+
+    if (typeof secretStorageKey === "string") {
+      return [secretStorageKey.trim()].filter(Boolean);
+    }
+
+    const values: string[] = [];
+    const pushValue = (value: string | string[] | undefined) => {
+      if (!value) {
+        return;
+      }
+      if (Array.isArray(value)) {
+        values.push(...value.map((item) => item.trim()).filter(Boolean));
+      } else {
+        const trimmed = value.trim();
+        if (trimmed) {
+          values.push(trimmed);
+        }
+      }
+    };
+
+    pushValue(secretStorageKey.current ?? secretStorageKey.primary);
+    pushValue(secretStorageKey.previous);
+    pushValue(secretStorageKey.fallback);
+    pushValue(secretStorageKey.additional);
+
+    return Array.from(new Set(values));
   }
 
   /**
@@ -114,12 +165,12 @@ export class SecretService {
     }
 
     // Encrypt before persistence if a key is configured.
-    const valueToStore = this.encKey
-      ? encryptSecret(preimage, this.encKey)
+    const valueToStore = this.writeKey
+      ? encryptSecret(preimage, this.writeKey)
       : preimage;
 
     // encVersion=1 means AES-256-GCM; null means plaintext.
-    const encVersion = this.encKey ? 1 : null;
+    const encVersion = this.writeKey ? 1 : null;
 
     try {
       await this.orders.recordSecret(publicId, valueToStore, txHash, encVersion);
@@ -128,7 +179,7 @@ export class SecretService {
     }
 
     this.log.debug(
-      { publicId, encrypted: !!this.encKey },
+      { publicId, encrypted: !!this.writeKey },
       "secret stored"
     );
     return { ok: true };
@@ -189,7 +240,7 @@ export class SecretService {
     }
 
     // Encrypted blob path.
-    if (!this.encKey) {
+    if (this.encKeys.length === 0) {
       // Blob present but no key — coordinator cannot decrypt.  This
       // happens if SECRET_STORAGE_KEY is removed after data was written.
       // Log a loud error so operators notice, and surface it via the API
@@ -205,15 +256,50 @@ export class SecretService {
       );
     }
 
+    let lastError: Error | undefined;
+    for (const key of this.encKeys) {
+      try {
+        const plaintext = decryptSecret(stored, key);
+        if (this.writeKey && key !== this.writeKey) {
+          await this.reencryptStoredSecret(publicId, plaintext, order, stored);
+        }
+        return plaintext;
+      } catch (err) {
+        lastError = err as Error;
+      }
+    }
+
+    this.log.error(
+      { publicId, err: lastError },
+      "SecretService: failed to decrypt stored preimage"
+    );
+    throw new Error(
+      `failed to decrypt preimage for order ${publicId}: ${(lastError as Error).message}`
+    );
+  }
+
+  private async reencryptStoredSecret(
+    publicId: string,
+    plaintext: string,
+    order: { secretRevealedTx?: string | null },
+    stored: string
+  ): Promise<void> {
+    if (!this.writeKey || !stored || !isEncryptedBlob(stored)) {
+      return;
+    }
+
     try {
-      return decryptSecret(stored, this.encKey);
-    } catch (err) {
-      this.log.error(
-        { publicId, err },
-        "SecretService: failed to decrypt stored preimage"
+      const reencrypted = encryptSecret(plaintext, this.writeKey);
+      await this.orders.recordSecret(
+        publicId,
+        reencrypted,
+        order.secretRevealedTx ?? "0xrekey",
+        1
       );
-      throw new Error(
-        `failed to decrypt preimage for order ${publicId}: ${(err as Error).message}`
+    } catch (err) {
+      this.log.warn(
+        { publicId, err },
+        "SecretService: opportunistic key rotation re-encryption skipped"
       );
     }
   }
