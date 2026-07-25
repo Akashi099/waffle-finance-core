@@ -135,6 +135,67 @@ export const activeOrders = new Gauge({
   registers: [registry]
 });
 
+/**
+ * Order lifecycle transitions counter.
+ *
+ * Records every successful order status transition with the direction,
+ * source state, and destination state.  Enables dashboards showing
+ * the flow of orders through the state machine, conversion funnels,
+ * and anomaly detection (e.g. unexpected surge of `announced→failed`).
+ */
+export const orderLifecycleTransitions = new Counter({
+  name: "coordinator_order_lifecycle_transitions_total",
+  help: "Total successful order lifecycle transitions by direction and (from→to) state pair",
+  labelNames: ["direction", "from", "to"] as const,
+  registers: [registry]
+});
+
+/**
+ * Duration an order spent in a given non-terminal state before transitioning.
+ *
+ * Measured as the wall-clock time (seconds) between the last state change
+ * and the current transition.  Use this to build heatmaps of state dwell
+ * times and alert on abnormally long lock periods.
+ *
+ * Only recorded when transitioning OUT of a state, so the initial
+ * `announced` state is captured on the first transition.
+ */
+export const orderStateDuration = new Histogram({
+  name: "coordinator_order_state_duration_seconds",
+  help: "Wall-clock seconds an order spent in a given state before transitioning",
+  labelNames: ["direction", "state"] as const,
+  buckets: [5, 10, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200],
+  registers: [registry]
+});
+
+/**
+ * Invalid transition attempts counter.
+ *
+ * Incremented whenever an order tries to transition from one status to
+ * another in a way that violates the state machine rules.  A non-zero
+ * rate indicates a bug in the listener or manual operator action.
+ */
+export const orderInvalidTransitions = new Counter({
+  name: "coordinator_order_invalid_transitions_total",
+  help: "Total invalid state transition attempts by (from→to) pair",
+  labelNames: ["from", "to"] as const,
+  registers: [registry]
+});
+
+/**
+ * Current order state distribution.
+ *
+ * A gauge set per (direction, status) pair reflecting the instantaneous
+ * count of orders in each state.  Useful for at-a-glance dashboards and
+ * alerting on orders stuck in intermediate states.
+ */
+export const orderCurrentState = new Gauge({
+  name: "coordinator_order_current_state",
+  help: "Instantaneous count of orders in each state by direction",
+  labelNames: ["direction", "state"] as const,
+  registers: [registry]
+});
+
 /** Reconciliation runs by result */
 export const reconciliationRuns = new Counter({
   name: "coordinator_reconciliation_runs_total",

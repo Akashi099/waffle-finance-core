@@ -4,10 +4,17 @@ import {
   type OrderRow,
   type OrderHistoryResult,
   type AnnounceOrderInput,
-  type Chain
+  type Chain,
+  type OrderStatus
 } from "../persistence/orders-repo.js";
 import { canTransition } from "../state-machine/order-machine.js";
-import { ordersTotal, resolverLockActionsTotal } from "../metrics.js";
+import {
+  ordersTotal,
+  orderLifecycleTransitions,
+  orderStateDuration,
+  orderCurrentState,
+  resolverLockActionsTotal
+} from "../metrics.js";
 import { announceSchema, type AnnounceInput } from "../validation/announce.js";
 import { HistoryCache } from "./history-cache.js";
 
@@ -17,6 +24,36 @@ export { announceSchema };
 export type { AnnounceInput };
 
 export class OrderValidationError extends Error {}
+
+/* ── Observability helpers ───────────────────────────────────────────────── */
+
+/**
+ * Record lifecycle transition metrics for an order moving from one state
+ * to another.  Updates:
+ *  - `orderLifecycleTransitions` counter (direction, from, to)
+ *  - `orderStateDuration` histogram for the time spent in the previous state
+ *  - `orderCurrentState` gauge (+1 for the new state, -1 for the old state)
+ *  - `ordersTotal` counter (cumulative count per status)
+ */
+function recordTransition(
+  direction: string,
+  from: OrderStatus,
+  to: OrderStatus,
+  updatedAtSeconds: number
+): void {
+  // Per-transition counter.
+  orderLifecycleTransitions.inc({ direction, from, to });
+
+  // Time in previous state: updatedAt is the timestamp the NEW state is being
+  // recorded, so we approximate duration using `createdAt` in the actual
+  // call sites.  This is a placeholder; the call site passes the order's
+  // `updatedAt` as a proxy for when the order entered `from`.
+  orderStateDuration.observe({ direction, state: from }, Math.max(Date.now() / 1000 - updatedAtSeconds, 0));
+
+  // Update instantaneous state distribution.
+  orderCurrentState.dec({ direction, state: from });
+  orderCurrentState.inc({ direction, state: to });
+}
 
 export class OrderService {
   private readonly historyCache: HistoryCache;
@@ -58,7 +95,14 @@ export class OrderService {
       { publicId: order.publicId, direction: order.direction, hashlock: order.hashlock },
       "order announced"
     );
-    ordersTotal.inc({ status: "announced" });
+
+    // ── Observability ───────────────────────────────────────────────────
+    // The order enters the system in the "announced" state.  Since there is
+    // no previous state to decrement, we only increment the new state gauge
+    // and the cumulative total counter.
+    ordersTotal.inc({ status: "announced", direction: order.direction });
+    orderLifecycleTransitions.inc({ direction: order.direction, from: "none", to: "announced" });
+    orderCurrentState.inc({ direction: order.direction, state: "announced" });
     
     // Invalidate cache for both source and destination addresses
     this.historyCache.invalidateAddress(order.srcAddress);
@@ -148,7 +192,10 @@ export class OrderService {
     }
     await this.repo.recordSrcLock(input);
     this.log.info({ publicId: input.publicId, srcOrderId: input.orderId }, "src lock recorded");
-    ordersTotal.inc({ status: "src_locked" });
+
+    // ── Observability ───────────────────────────────────────────────────
+    recordTransition(order.direction, order.status, "src_locked", order.updatedAt);
+    ordersTotal.inc({ status: "src_locked", direction: order.direction });
     
     // Invalidate cache for both addresses since order status changed
     this.historyCache.invalidateAddress(order.srcAddress);
@@ -177,7 +224,10 @@ export class OrderService {
     }
     await this.repo.recordDstLock(input);
     this.log.info({ publicId: input.publicId, dstOrderId: input.orderId, resolver: input.resolver }, "dst lock recorded");
-    ordersTotal.inc({ status: "dst_locked" });
+
+    // ── Observability ───────────────────────────────────────────────────
+    recordTransition(order.direction, order.status, "dst_locked", order.updatedAt);
+    ordersTotal.inc({ status: "dst_locked", direction: order.direction });
     
     // Invalidate cache for both addresses since order status changed
     this.historyCache.invalidateAddress(order.srcAddress);
@@ -203,7 +253,10 @@ export class OrderService {
     }
     await this.repo.recordSecretRevealed({ publicId, preimage, txHash, encVersion });
     this.log.info({ publicId }, "secret recorded");
-    ordersTotal.inc({ status: "secret_revealed" });
+
+    // ── Observability ───────────────────────────────────────────────────
+    recordTransition(order.direction, order.status, "secret_revealed", order.updatedAt);
+    ordersTotal.inc({ status: "secret_revealed", direction: order.direction });
     
     // Invalidate cache for both addresses since order status changed
     this.historyCache.invalidateAddress(order.srcAddress);
@@ -225,7 +278,10 @@ export class OrderService {
     }
     await this.repo.setStatus(publicId, status);
     this.log.info({ publicId, status }, "status updated");
-    ordersTotal.inc({ status });
+
+    // ── Observability ───────────────────────────────────────────────────
+    recordTransition(order.direction, order.status, status, order.updatedAt);
+    ordersTotal.inc({ status, direction: order.direction });
     
     // Invalidate cache for both addresses since order status changed
     this.historyCache.invalidateAddress(order.srcAddress);
