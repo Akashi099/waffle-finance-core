@@ -8,6 +8,12 @@ export default defineConfig({
       // source so vitest doesn't need a compiled dist/ to run tests.
       "@wafflefinance/config/node": resolve(__dirname, "../packages/config/src/node.ts"),
       "@wafflefinance/config": resolve(__dirname, "../packages/config/src/index.ts"),
+      // Map SDK sub-paths to source so the compat harness can import
+      // SDK types and state-machine directly without a built dist/.
+      "@wafflefinance/sdk/ethereum": resolve(__dirname, "../packages/sdk/src/ethereum/index.ts"),
+      "@wafflefinance/sdk/state-machine": resolve(__dirname, "../packages/sdk/src/state-machine/index.ts"),
+      "@wafflefinance/sdk/types": resolve(__dirname, "../packages/sdk/src/types/index.ts"),
+      "@wafflefinance/sdk": resolve(__dirname, "../packages/sdk/src/index.ts"),
     },
   },
   test: {
