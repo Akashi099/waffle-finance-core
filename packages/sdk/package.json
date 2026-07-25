@@ -58,6 +58,10 @@
     "./shared-utils": {
       "import": "./dist/shared-utils/index.js",
       "types": "./dist/shared-utils/index.d.ts"
+    },
+    "./coordinator": {
+      "import": "./dist/coordinator/index.js",
+      "types": "./dist/coordinator/index.d.ts"
     }
   },
   "files": [
