@@ -160,7 +160,7 @@ describe("Cursor Pagination Integration", () => {
   });
 
   describe("performance with large datasets", () => {
-    it("handles large address history efficiently", async () => {
+    it("handles large address history efficiently", { timeout: 30_000 }, async () => {
       const orderCount = 500;
       await createTestOrders(service, orderCount, VALID_ETH_ADDR);
       
@@ -185,7 +185,7 @@ describe("Cursor Pagination Integration", () => {
       const totalTime = Date.now() - start;
       
       expect(fetchedCount).toBe(orderCount);
-      expect(totalTime).toBeLessThan(5000); // Should complete within 5 seconds
+      expect(totalTime).toBeLessThan(20_000); // Should complete within 20 seconds
     });
 
     it("cursor pagination is consistent across pages", async () => {

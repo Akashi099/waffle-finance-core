@@ -18,6 +18,8 @@ import type { StartupPhase } from "./readiness.js";
 import { retryAsync } from "./retry.js";
 import { solanaPlaceholderMode } from "./metrics.js";
 import type { CoordinatorConfig } from "./config.js";
+import { AuditRepository } from "./audit/audit-repo.js";
+import { buildSystemAuditEntry } from "./audit/audit-log.js";
 
 // ── Startup dependency probes ────────────────────────────────────────────────
 
@@ -216,9 +218,15 @@ async function main(): Promise<void> {
   let startupPhase: StartupPhase = "starting";
 
   const repo = new OrdersRepository(db);
-  const orders = new OrderService(repo, log);
+  const auditRepo = new AuditRepository(db);
+  const orders = new OrderService(repo, log, { auditRepo });
   const secrets = new SecretService(orders, log, cfg.secretStorageKey ?? undefined);
   const quotes = new QuoteService(log);
+
+  // Record coordinator startup in the audit log (best-effort).
+  auditRepo.append(buildSystemAuditEntry('system.startup', 'coordinator started', {
+    serviceVersion: process.env.npm_package_version ?? null,
+  })).catch(() => {/* non-fatal */});
 
   const reconciler = new Reconciler(cfg, orders, log);
   const staleCleanup = new StaleCleanupService(repo, log);
@@ -251,6 +259,7 @@ async function main(): Promise<void> {
     orders,
     secrets,
     quotes,
+    auditRepo,
     getReconciliationStatus: () => reconciler.getStatus(),
     getReadinessChecks: createReadinessChecks({
       cfg,
@@ -353,6 +362,8 @@ async function main(): Promise<void> {
   // ── 8. Graceful shutdown ────────────────────────────────────────────────
   const shutdown = async (signal: string) => {
     log.info({ signal }, "shutting down");
+    auditRepo.append(buildSystemAuditEntry('system.shutdown', `coordinator shutdown via ${signal}`))
+      .catch(() => {/* non-fatal */});
     clearInterval(reconcileInterval);
     clearInterval(expiryInterval);
     clearInterval(staleCleanupInterval);

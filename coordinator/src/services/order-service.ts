@@ -17,6 +17,9 @@ import {
 } from "../metrics.js";
 import { announceSchema, type AnnounceInput } from "../validation/announce.js";
 import { HistoryCache } from "./history-cache.js";
+import type { AuditRepository } from "../audit/audit-repo.js";
+import { buildOrderAuditEntry } from "../audit/audit-log.js";
+import { getRequestId } from "../request-context.js";
 
 // Re-exported so existing importers (routes, services barrel) keep working
 // while the schema itself now lives in the shared validation module.
@@ -61,8 +64,10 @@ export class OrderService {
   constructor(
     private readonly repo: OrdersRepository,
     private readonly log: Logger,
-    options: { enableCache?: boolean; cacheTtlMs?: number } = {}
+    options: { enableCache?: boolean; cacheTtlMs?: number; auditRepo?: AuditRepository } = {},
+    private readonly auditRepo?: AuditRepository
   ) {
+    this.auditRepo = options.auditRepo;
     // Initialize cache if enabled (default: enabled)
     if (options.enableCache !== false) {
       this.historyCache = new HistoryCache(log.child({ component: 'history-cache' }), {
@@ -71,6 +76,14 @@ export class OrderService {
     } else {
       this.historyCache = new HistoryCache(log, { ttlMs: 0 }); // Disabled cache
     }
+  }
+
+  /** Fire-and-forget audit write — never throws into the caller. */
+  private audit(entry: Parameters<AuditRepository['append']>[0]): void {
+    if (!this.auditRepo) return;
+    this.auditRepo.append(entry).catch((err: unknown) => {
+      this.log.warn({ err }, 'audit write failed (non-fatal)');
+    });
   }
 
   /**
@@ -291,11 +304,33 @@ export class OrderService {
   async rollbackSrcLock(publicId: string): Promise<void> {
     await this.repo.rollbackSrcLock(publicId);
     this.log.warn({ publicId }, "rolled back src lock");
+    this.audit(buildOrderAuditEntry('order.src_lock_rolled_back', {
+      orderId: publicId,
+      hashlock: '',
+      direction: '',
+      fromStatus: 'src_locked',
+      toStatus: 'announced',
+      srcChain: '',
+      dstChain: '',
+      detail: 'reorg or duplicate event triggered rollback',
+      requestId: getRequestId(),
+    }));
   }
 
   async rollbackDstLock(publicId: string): Promise<void> {
     await this.repo.rollbackDstLock(publicId);
     this.log.warn({ publicId }, "rolled back dst lock");
+    this.audit(buildOrderAuditEntry('order.dst_lock_rolled_back', {
+      orderId: publicId,
+      hashlock: '',
+      direction: '',
+      fromStatus: 'dst_locked',
+      toStatus: 'src_locked',
+      srcChain: '',
+      dstChain: '',
+      detail: 'reorg or duplicate event triggered rollback',
+      requestId: getRequestId(),
+    }));
   }
 
   async getLastProcessedBlock(chain: Chain): Promise<number> {

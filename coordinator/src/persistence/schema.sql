@@ -96,3 +96,32 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     duration_ms INTEGER NOT NULL
 );
 
+
+-- ── Audit log ─────────────────────────────────────────────────────────────────
+-- Durable, append-only record of order lifecycle transitions and recovery
+-- actions.  Rows are never updated or deleted.
+-- See coordinator/src/audit/audit-log.ts for the full type contract.
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id             INTEGER  PRIMARY KEY AUTOINCREMENT,
+    schema_version INTEGER  NOT NULL DEFAULT 1,
+    event_type     TEXT     NOT NULL,
+    order_id       TEXT,
+    request_id     TEXT,
+    payload_json   TEXT     NOT NULL,
+    created_at     INTEGER  NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_order_id
+    ON audit_log (order_id, id ASC)
+    WHERE order_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_id_asc
+    ON audit_log (id ASC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_event_type
+    ON audit_log (event_type, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_created_at
+    ON audit_log (created_at DESC);
+
