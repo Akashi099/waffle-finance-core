@@ -1,6 +1,7 @@
 import type { CoordinatorConfig } from "./config.js";
 import type { Database } from "./persistence/db.js";
 import type { ReconciliationStatus } from "./reconciliation/reconciler.js";
+import type { CacheVerificationStatus } from "./reconciliation/cache-verifier.js";
 import type { ReadinessCheck } from "./server/routes/health.js";
 import { isSolanaPlaceholder } from "./config.js";
 
@@ -48,6 +49,16 @@ export interface ReadinessDeps {
    * its startup sequence.
    */
   getStartupPhase?: () => StartupPhase;
+  /**
+   * When provided, the readiness check will include a `cache_alignment`
+   * entry derived from the most recent CacheVerifier run result.
+   *
+   * The check is non-blocking: a cache that has never been verified is
+   * reported as ok=true with detail="not_run_yet" rather than failing the
+   * readiness gate.  Only an actively misaligned cache (mismatches > 0)
+   * or a failed verifier run marks the check as ok=false.
+   */
+  getCacheVerificationStatus?: () => CacheVerificationStatus;
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -118,6 +129,33 @@ function reconciliationCheck(status: ReconciliationStatus): ReadinessCheck {
 }
 
 /**
+ * Derive a `cache_alignment` ReadinessCheck from the latest CacheVerifier
+ * result.
+ *
+ * Semantics:
+ *  - Never verified yet   → ok=true, detail="not_run_yet"  (non-blocking)
+ *  - Verifier run failed  → ok=false, detail="verifier_error"
+ *  - Mismatches detected  → ok=false, detail="mismatches_detected:<n>"
+ *  - Aligned              → ok=true,  detail="aligned"
+ */
+function cacheAlignmentCheck(status: CacheVerificationStatus): ReadinessCheck {
+  if (status.lastRunAt === null) {
+    return { name: "cache_alignment", ok: true, detail: "not_run_yet" };
+  }
+  if (status.lastRunOk === false) {
+    return { name: "cache_alignment", ok: false, detail: "verifier_error" };
+  }
+  if (status.mismatches.length > 0) {
+    return {
+      name: "cache_alignment",
+      ok: false,
+      detail: `mismatches_detected:${status.mismatches.length}`,
+    };
+  }
+  return { name: "cache_alignment", ok: true, detail: "aligned" };
+}
+
+/**
  * Derive an overall StartupPhase from the list of individual checks.
  *
  * Rules (applied in priority order):
@@ -175,6 +213,7 @@ export function createReadinessChecks({
   fetcher = globalThis.fetch as FetchLike,
   timeoutMs = 750,
   getStartupPhase,
+  getCacheVerificationStatus,
 }: ReadinessDeps): () => Promise<ReadinessCheck[]> {
   return async () => {
     // The Solana RPC probe is skipped when the program ID is a placeholder.
@@ -200,6 +239,12 @@ export function createReadinessChecks({
       solanaCheck,
       reconciliationCheck(getReconciliationStatus()),
     ];
+
+    // Cache alignment check — appended after the core checks so it is clearly
+    // grouped with operational / sync state rather than infrastructure health.
+    if (getCacheVerificationStatus) {
+      checks.push(cacheAlignmentCheck(getCacheVerificationStatus()));
+    }
 
     // Inject a synthetic startup_phase check when the caller provides a phase
     // getter.  This surfaces the coordinator's lifecycle stage in the /readyz
