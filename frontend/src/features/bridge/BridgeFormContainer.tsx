@@ -1,14 +1,16 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { 
-  Horizon, 
-  Asset, 
-  Operation, 
-  TransactionBuilder, 
+import {
+  Horizon,
+  Asset,
+  Operation,
+  TransactionBuilder,
   Memo
 } from '@stellar/stellar-sdk';
+import { classifyRpcError, parseBalanceHex } from '@wafflefinance/sdk/shared-utils';
 import { isTestnet, getCurrentNetwork } from '../../config/networks';
 import { parseHtlcReceipt } from '../../lib/parseHtlcReceipt';
 import { sanitizeAmountInput } from '../../lib/sanitizeAmountInput';
+import { usePersistedBridgeDraft } from '../../hooks/usePersistedBridgeDraft';
 import { ArrowDownUp, CheckCircle2, Loader2, RefreshCw, Settings2 } from 'lucide-react';
 import {
   validateAmount,
@@ -17,6 +19,14 @@ import {
   validateDestinationChain,
   validateRouteWallets,
 } from '../../utils/validation';
+import {
+  callApi,
+  classifyProviderError,
+  classifyReceiptTimeout,
+  classifyRevertedTx,
+  buildFallbackRecord,
+  type OrderSubmissionFailure,
+} from '../../lib/orderSubmissionFallback';
 
 export interface BridgeFormProps {
   ethAddress: string;
@@ -148,6 +158,53 @@ const saveTransactionToHistory = (transaction: {
   }
 };
 
+// Helper function to save a fallback (failed) transaction record to localStorage
+// so TransactionHistory always shows an explicit entry even for orders that
+// never made it on-chain. The `status` field is kept as 'failed' to slot into
+// the existing filter, with the error detail preserved in the record for display.
+const saveFallbackToHistory = (record: import('../../lib/orderSubmissionFallback').FallbackTransactionRecord) => {
+  try {
+    const isTestnetMode = isTestnet();
+    const historyEntry = {
+      id: record.id,
+      txHash: record.id,              // no on-chain tx — use the record id as placeholder
+      fromNetwork: record.direction.startsWith('eth') && !record.direction.endsWith('sol')
+        ? (isTestnetMode ? 'ETH Sepolia' : 'ETH Mainnet')
+        : record.direction.startsWith('xlm')
+          ? (isTestnetMode ? 'Stellar Testnet' : 'Stellar Mainnet')
+          : (isTestnetMode ? 'Solana Devnet' : 'Solana Mainnet'),
+      toNetwork: record.direction.endsWith('xlm')
+        ? (isTestnetMode ? 'Stellar Testnet' : 'Stellar Mainnet')
+        : record.direction.endsWith('sol')
+          ? (isTestnetMode ? 'Solana Devnet' : 'Solana Mainnet')
+          : (isTestnetMode ? 'ETH Sepolia' : 'ETH Mainnet'),
+      fromToken: record.direction.startsWith('eth') ? 'ETH' : record.direction.startsWith('xlm') ? 'XLM' : 'SOL',
+      toToken: record.direction.endsWith('xlm') ? 'XLM' : record.direction.endsWith('sol') ? 'SOL' : 'ETH',
+      amount: record.amount,
+      estimatedAmount: record.estimatedAmount,
+      ethAddress: record.srcAddress,
+      stellarAddress: record.dstAddress,
+      status: 'failed' as const,
+      timestamp: record.timestamp,
+      direction: record.direction,
+      // Store the structured error so the UI can surface "Why did this fail?"
+      errorCode: record.errorCode,
+      errorMessage: record.errorMessage,
+      networkMode: (isTestnetMode ? 'testnet' : 'mainnet') as 'testnet' | 'mainnet',
+    };
+
+    const existing = localStorage.getItem('wafflefinance_transactions_v2');
+    const transactions = existing ? JSON.parse(existing) : [];
+    transactions.unshift(historyEntry);
+    if (transactions.length > 50) transactions.splice(50);
+    localStorage.setItem('wafflefinance_transactions_v2', JSON.stringify(transactions));
+
+    console.log('💾 Fallback record saved to history:', historyEntry);
+  } catch (err) {
+    console.error('❌ Failed to save fallback record to history:', err);
+  }
+};
+
 // Helper function to update transaction status in localStorage
 const updateTransactionStatus = (orderId: string, status: 'pending' | 'completed' | 'failed' | 'cancelled', additionalData?: any) => {
   try {
@@ -185,7 +242,17 @@ const API_BASE_URL = import.meta.env.PROD
 const ENABLE_MOCK_DATA = import.meta.env.VITE_ENABLE_MOCK_DATA === 'true';
 
 export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, signStellarTransaction }: BridgeFormProps): React.JSX.Element {
-  const [direction, setDirection] = useState<BridgeDirection>('eth_to_xlm');
+  const {
+    direction,
+    amount,
+    setDirection,
+    setAmount,
+    clearPersistedDraft,
+  } = usePersistedBridgeDraft({
+    ethAddress,
+    stellarAddress,
+    solanaAddress,
+  });
   const [networkInfo, setNetworkInfo] = useState(() => {
     const currentNetwork = getCurrentNetwork();
     const isTestnetMode = isTestnet();
@@ -231,7 +298,6 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
       clearInterval(interval);
     };
   }, []);
-  const [amount, setAmount] = useState('');
   const [estimatedAmount, setEstimatedAmount] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [orderCreated, setOrderCreated] = useState(false);
@@ -271,13 +337,19 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
 
     const fetchEthBalance = async (addr: string): Promise<string> => {
       if (!window.ethereum) throw new Error('MetaMask not available');
+      // parseBalanceHex handles both `0x` prefixed hex and bare decimal text,
+      // so we behave identically across providers that return one or the other.
       const raw = await window.ethereum.request({ method: 'eth_getBalance', params: [addr, 'latest'] });
-      return (parseInt(raw, 16) / 1e18).toFixed(4);
+      return (Number(parseBalanceHex(raw)) / 1e18).toFixed(4);
     };
 
     const fetchXlmBalance = async (addr: string): Promise<string> => {
       const response = await fetch(`${networkInfo.stellar.horizonUrl}/accounts/${addr}`);
-      if (!response.ok) return '0.0000';
+      if (!response.ok) {
+        // Horizon returns 404 for unfunded accounts; that's not a provider failure.
+        if (response.status === 404) return '0.0000';
+        throw new Error(`HTTP ${response.status} from Horizon`);
+      }
       const data = await response.json();
       const bal = data.balances?.find((b: any) => b.asset_type === 'native')?.balance || '0';
       return parseFloat(bal).toFixed(4);
@@ -292,21 +364,45 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getBalance', params: [addr] }),
       });
+      if (!res.ok) throw new Error(`HTTP ${res.status} from Solana RPC`);
       const json = await res.json();
-      return (json.result?.value / 1e9 || 0).toFixed(4);
+      if (json?.error) throw new Error(`Solana RPC error: ${json.error.message ?? 'unknown'}`);
+      const lamports = BigInt(json.result?.value ?? 0n);
+      return (Number(lamports) / 1e9).toFixed(4);
     };
 
     const loadBalance = async () => {
       const src = DIRECTION_MAP[direction].from;
+      // Clear persisted amount if the user has no wallet that could fund
+      // the current direction — avoids restoring a stale draft pointing
+      // at a chain the user is no longer connected to.
+      if (!(ethAddress || stellarAddress || solanaAddress)) {
+        setAmount('');
+      }
       if (src.symbol === 'ETH' && ethAddress) {
         setBalance('Loading...');
-        try { setBalance(await fetchEthBalance(ethAddress)); } catch { setBalance('0'); }
+        try {
+          setBalance(await fetchEthBalance(ethAddress));
+        } catch (err) {
+          console.warn('ETH balance fetch failed:', classifyRpcError(err).category, classifyRpcError(err).message);
+          setBalance('0');
+        }
       } else if (src.symbol === 'XLM' && stellarAddress) {
         setBalance('Loading...');
-        try { setBalance(await fetchXlmBalance(stellarAddress)); } catch { setBalance('0'); }
+        try {
+          setBalance(await fetchXlmBalance(stellarAddress));
+        } catch (err) {
+          console.warn('XLM balance fetch failed:', classifyRpcError(err).category, classifyRpcError(err).message);
+          setBalance('0');
+        }
       } else if (src.symbol === 'SOL' && solanaAddress) {
         setBalance('Loading...');
-        try { setBalance(await fetchSolBalance(solanaAddress)); } catch { setBalance('0'); }
+        try {
+          setBalance(await fetchSolBalance(solanaAddress));
+        } catch (err) {
+          console.warn('SOL balance fetch failed:', classifyRpcError(err).category, classifyRpcError(err).message);
+          setBalance('0');
+        }
       } else {
         setBalance('0');
       }
@@ -781,9 +877,24 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
                 console.log('✅ Transaction confirmed via alternative method!');
                 receipt = { status: '0x1' }; // Assume success if confirmed
               } else {
-                throw new Error('Transaction confirmation timeout');
+                // Receipt polling exhausted — classify via the typed fallback.
+                const timeout = classifyReceiptTimeout(txHash);
+                const fallbackRecord = buildFallbackRecord(timeout, {
+                  id: result.orderId || `receipt-timeout-${Date.now()}`,
+                  direction: 'eth-to-xlm',
+                  amount,
+                  estimatedAmount,
+                  srcAddress: ethAddress,
+                  dstAddress: stellarAddress,
+                });
+                saveFallbackToHistory(fallbackRecord);
+                throw new Error(timeout.message);
               }
             } catch (altError) {
+              if ((altError as Error).message?.includes('confirmation timed out') ||
+                  (altError as Error).message?.includes('timed out')) {
+                throw altError;
+              }
               console.error('❌ Alternative confirmation also failed:', altError);
               throw new Error('Transaction confirmation timeout');
             }
@@ -834,9 +945,27 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           });
 
           if (!isSuccess) {
+            const reverted = classifyRevertedTx(txHash);
+            saveTransactionToHistory({
+              orderId: result.orderId,
+              txHash: txHash,
+              direction: 'eth-to-xlm',
+              amount: amount,
+              estimatedAmount: estimatedAmount,
+              ethAddress: ethAddress,
+              stellarAddress: stellarAddress,
+              ethTxHash: txHash,
+              status: 'failed',
+              onChainOrderId: refundMeta?.orderId,
+              htlcContractAddress: refundMeta?.contractAddress,
+              htlcContractMode: refundMeta?.contractMode,
+              timelockUnixSeconds: refundMeta?.timelockUnixSeconds,
+              amountWei: refundMeta?.amountWei,
+            });
             setStatusMessage('Failed ❌');
             setIsSubmitting(false);
-            throw new Error('Transaction failed on blockchain');
+            alert(reverted.message);
+            throw new Error(reverted.message);
           }
           
           console.log('✅ Transaction confirmed successfully!');
@@ -945,30 +1074,23 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
         } catch (txError: any) {
           console.error('❌ Approval transaction failed:', txError);
           
+          // Route through the typed fallback contract.
+          const submissionFailure = classifyProviderError(txError);
+          const fallbackRecord = buildFallbackRecord(submissionFailure, {
+            id: result.orderId || `eth-err-${Date.now()}`,
+            direction: 'eth-to-xlm',
+            amount,
+            estimatedAmount,
+            srcAddress: ethAddress,
+            dstAddress: stellarAddress,
+          });
+          saveFallbackToHistory(fallbackRecord);
+          
           // Update status to failed
           setStatusMessage('Failed ❌');
           setIsSubmitting(false);
           
-          console.error('🔍 Full error details:', {
-            code: txError.code,
-            message: txError.message,
-            data: txError.data,
-            stack: txError.stack
-          });
-          
-          // Handle MetaMask errors with more specific messages
-          if (txError.code === 4001) {
-            alert('Transaction was rejected by user');
-          } else if (txError.code === -32603) {
-            alert('Transaction failed. Please check your balance and try again.');
-          } else if (txError.code === -32000) {
-            alert('Insufficient funds for gas * price + value');
-          } else if (txError.code === -32602) {
-            alert('Invalid transaction parameters');
-          } else {
-            const errorMsg = txError.message || txError.reason || 'Unknown error occurred';
-            alert(`Transaction error: ${errorMsg}`);
-          }
+          alert(submissionFailure.message);
           return; // Don't show success if transaction failed
         }
       } else if (direction === 'xlm_to_eth') {
@@ -1205,18 +1327,31 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
               dstAsset: 'native', dstAmount: ethAmountWei,
             };
 
-        const announceRes = await fetch(`${API_BASE_URL}/api/orders/announce`, {
+        const announceResult = await callApi(`${API_BASE_URL}/api/orders/announce`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(announceBody),
         });
 
-        if (!announceRes.ok) {
-          const err = await announceRes.json().catch(() => ({}));
-          throw new Error(err.error || `Coordinator error: ${announceRes.status}`);
+        if (!announceResult.ok) {
+          // Typed fallback: write a record to history so the user sees an
+          // explicit entry rather than a silent no-op, then surface the error.
+          const fallbackRecord = buildFallbackRecord(announceResult, {
+            id: `sol-err-${Date.now()}`,
+            direction: direction === 'eth_to_sol' ? 'eth-to-sol' : 'sol-to-eth',
+            amount,
+            estimatedAmount,
+            srcAddress: direction === 'eth_to_sol' ? ethAddress : (solanaAddress ?? ''),
+            dstAddress: direction === 'eth_to_sol' ? (solanaAddress ?? '') : ethAddress,
+          });
+          saveFallbackToHistory(fallbackRecord);
+          alert(announceResult.message);
+          setIsSubmitting(false);
+          setStatusMessage('');
+          return;
         }
 
-        const announced = await announceRes.json();
+        const announced = announceResult.body ?? {};
         console.log('✅ Solana order announced:', announced);
 
         saveTransactionToHistory({
@@ -1252,8 +1387,29 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
     } catch (error: any) {
       console.error('❌ Error creating order:', error);
       
-      // Show error message
-      alert(`Error: ${error.message || 'Unknown error occurred'}`);
+      // Route through the typed fallback contract so the failure is
+      // always structured — never a silent no-op.
+      const submissionFailure: OrderSubmissionFailure = classifyProviderError(error);
+      
+      // Write a fallback record to history so TransactionHistory shows an
+      // explicit entry for this failed attempt.
+      const fallbackRecord = buildFallbackRecord(submissionFailure, {
+        id: `err-${Date.now()}`,
+        direction: (
+          direction === 'eth_to_xlm' ? 'eth-to-xlm' :
+          direction === 'xlm_to_eth' ? 'xlm-to-eth' :
+          direction === 'eth_to_sol' ? 'eth-to-sol' :
+          'sol-to-eth'
+        ),
+        amount,
+        estimatedAmount,
+        srcAddress: direction.startsWith('eth') ? ethAddress : (stellarAddress || solanaAddress || ''),
+        dstAddress: direction.endsWith('eth') ? ethAddress : (stellarAddress || solanaAddress || ''),
+      });
+      saveFallbackToHistory(fallbackRecord);
+      
+      // Show a clear, user-readable message.
+      alert(submissionFailure.message);
     } finally {
       setIsSubmitting(false);
     }
@@ -1265,6 +1421,9 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
     setEstimatedAmount('');
     setOrderCreated(false);
     setOrderId(null);
+    // Also clear the persisted draft so a successful swap is followed by a
+    // truly fresh form on the next visit.
+    clearPersistedDraft();
   };
 
   // Check if wallets are connected
