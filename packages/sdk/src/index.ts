@@ -126,3 +126,73 @@ export {
 
 // Solana — normalised adapter
 export { SolanaHTLCAdapter } from "./solana/adapter.js";
+
+// Coordinator — typed HTTP client, contract types, history client,
+// event subscription, and local request validation (Issues #355–#360)
+export {
+  // client
+  CoordinatorClient,
+  // history
+  HistoryClient,
+  toHistoryRecord,
+  // subscription
+  OrderSubscriber,
+  // validation
+  validateAnnounceRequest,
+  assertValidAnnounceRequest,
+  validateHashlockField,
+  validateChainAddress,
+  validateDecimalIntField,
+  DIRECTION_CHAINS,
+  SUPPORTED_DIRECTIONS,
+  // transforms
+  toOrder,
+  toOrders,
+  // type guards
+  isCursorPagination,
+  isCoordinatorError,
+  // errors
+  CoordinatorError,
+  CoordinatorApiError,
+  CoordinatorParseError,
+  CoordinatorNetworkError,
+  CoordinatorValidationError,
+} from "./coordinator/index.js";
+export type {
+  // contract types
+  CoordinatorDirection,
+  CoordinatorChainLeg,
+  CoordinatorSecretBlock,
+  CoordinatorOrder,
+  CoordinatorHistoryResponse,
+  CoordinatorOffsetPagination,
+  CoordinatorCursorPagination,
+  CoordinatorSecretResponse,
+  CoordinatorRevealResponse,
+  CoordinatorRevealRequest,
+  CoordinatorAnnounceRequest,
+  CoordinatorErrorResponse,
+  CoordinatorHealthResponse,
+  CoordinatorReadinessResponse,
+  // client options
+  CoordinatorClientOptions,
+  GetHistoryOptions,
+  // history
+  HistoryRecord,
+  HistoryPagination,
+  HistoryPage,
+  HistoryClientOptions,
+  // subscription
+  OrderSubscriberOptions,
+  OrderSubscriptionEvents,
+  OrderSubscriptionEventName,
+  StatusChangedEvent,
+  SecretRevealedEvent,
+  OrderSettledEvent,
+  SubscriptionErrorEvent,
+  SubscriptionStartedEvent,
+  SubscriptionStoppedEvent,
+  // validation
+  ValidationIssue,
+  ValidationResult,
+} from "./coordinator/index.js";
