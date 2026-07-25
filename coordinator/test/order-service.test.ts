@@ -8,6 +8,7 @@ import { openDatabase, PostgresStatement } from "../src/persistence/db.js";
 import { OrdersRepository } from "../src/persistence/orders-repo.js";
 import { OrderService, OrderValidationError } from "../src/services/order-service.js";
 import { SecretService } from "../src/services/secret-service.js";
+import { registry } from "../src/metrics.js";
 
 const log = pino({ level: "silent" });
 
@@ -85,6 +86,57 @@ describe("OrderService", () => {
 
   // Cross-field (direction/chain) and address validation now lives in
   // `announceSchema` — see announce-schema.test.ts for the full matrix.
+
+  it("records lifecycle transition metrics for status changes", async () => {
+    registry.resetMetrics();
+    const db = await freshDb();
+    const orders = new OrderService(new OrdersRepository(db), log);
+    const order = await orders.announce({
+      direction: "eth_to_xlm",
+      hashlock: VALID_HASHLOCK,
+      srcChain: "ethereum",
+      srcAddress: VALID_ETH_ADDR,
+      srcAsset: "native",
+      srcAmount: "1",
+      srcSafetyDeposit: "1",
+      dstChain: "stellar",
+      dstAddress: VALID_STELLAR_ADDR,
+      dstAsset: "native",
+      dstAmount: "1"
+    });
+
+    await orders.recordSrcLock({
+      publicId: order.publicId,
+      orderId: "1",
+      txHash: "0xsrc",
+      blockNumber: 1,
+      timelock: 0
+    });
+
+    await orders.recordDstLock({
+      publicId: order.publicId,
+      orderId: "2",
+      txHash: "0xdst",
+      blockNumber: 2,
+      timelock: 0,
+      resolver: null
+    });
+
+    await orders.recordSecret(
+      order.publicId,
+      "0x" + "a".repeat(64),
+      "0xsecret"
+    );
+
+    await orders.markStatus(order.publicId, "completed");
+
+    const metrics = await registry.metrics();
+    expect(metrics).toContain('coordinator_order_lifecycle_transitions_total{direction="eth_to_xlm",from="none",to="announced"} 1');
+    expect(metrics).toContain('coordinator_order_lifecycle_transitions_total{direction="eth_to_xlm",from="announced",to="src_locked"} 1');
+    expect(metrics).toContain('coordinator_order_lifecycle_transitions_total{direction="eth_to_xlm",from="src_locked",to="dst_locked"} 1');
+    expect(metrics).toContain('coordinator_order_lifecycle_transitions_total{direction="eth_to_xlm",from="dst_locked",to="secret_revealed"} 1');
+    expect(metrics).toContain('coordinator_order_lifecycle_transitions_total{direction="eth_to_xlm",from="secret_revealed",to="completed"} 1');
+  });
 
   it("ignores duplicate srcLock and dstLock events idempotently", async () => {
     const db = await freshDb();
