@@ -10,6 +10,9 @@ import { canTransition } from "../state-machine/order-machine.js";
 import { ordersTotal, resolverLockActionsTotal } from "../metrics.js";
 import { announceSchema, type AnnounceInput } from "../validation/announce.js";
 import { HistoryCache } from "./history-cache.js";
+import type { AuditRepository } from "../audit/audit-repo.js";
+import { buildOrderAuditEntry } from "../audit/audit-log.js";
+import { getRequestId } from "../request-context.js";
 
 // Re-exported so existing importers (routes, services barrel) keep working
 // while the schema itself now lives in the shared validation module.
@@ -24,8 +27,10 @@ export class OrderService {
   constructor(
     private readonly repo: OrdersRepository,
     private readonly log: Logger,
-    options: { enableCache?: boolean; cacheTtlMs?: number } = {}
+    options: { enableCache?: boolean; cacheTtlMs?: number; auditRepo?: AuditRepository } = {},
+    private readonly auditRepo?: AuditRepository
   ) {
+    this.auditRepo = options.auditRepo;
     // Initialize cache if enabled (default: enabled)
     if (options.enableCache !== false) {
       this.historyCache = new HistoryCache(log.child({ component: 'history-cache' }), {
@@ -34,6 +39,14 @@ export class OrderService {
     } else {
       this.historyCache = new HistoryCache(log, { ttlMs: 0 }); // Disabled cache
     }
+  }
+
+  /** Fire-and-forget audit write — never throws into the caller. */
+  private audit(entry: Parameters<AuditRepository['append']>[0]): void {
+    if (!this.auditRepo) return;
+    this.auditRepo.append(entry).catch((err: unknown) => {
+      this.log.warn({ err }, 'audit write failed (non-fatal)');
+    });
   }
 
   /**
@@ -59,7 +72,18 @@ export class OrderService {
       "order announced"
     );
     ordersTotal.inc({ status: "announced" });
-    
+
+    this.audit(buildOrderAuditEntry('order.announced', {
+      orderId: order.publicId,
+      hashlock: order.hashlock,
+      direction: order.direction,
+      fromStatus: null,
+      toStatus: 'announced',
+      srcChain: order.srcChain,
+      dstChain: order.dstChain,
+      requestId: getRequestId(),
+    }));
+
     // Invalidate cache for both source and destination addresses
     this.historyCache.invalidateAddress(order.srcAddress);
     this.historyCache.invalidateAddress(order.dstAddress);
@@ -127,7 +151,20 @@ export class OrderService {
     await this.repo.recordSrcLock(input);
     this.log.info({ publicId: input.publicId, srcOrderId: input.orderId }, "src lock recorded");
     ordersTotal.inc({ status: "src_locked" });
-    
+
+    this.audit(buildOrderAuditEntry('order.src_locked', {
+      orderId: order.publicId,
+      hashlock: order.hashlock,
+      direction: order.direction,
+      fromStatus: order.status,
+      toStatus: 'src_locked',
+      srcChain: order.srcChain,
+      dstChain: order.dstChain,
+      txHash: input.txHash,
+      blockNumber: input.blockNumber,
+      requestId: getRequestId(),
+    }));
+
     // Invalidate cache for both addresses since order status changed
     this.historyCache.invalidateAddress(order.srcAddress);
     this.historyCache.invalidateAddress(order.dstAddress);
@@ -156,7 +193,21 @@ export class OrderService {
     await this.repo.recordDstLock(input);
     this.log.info({ publicId: input.publicId, dstOrderId: input.orderId, resolver: input.resolver }, "dst lock recorded");
     ordersTotal.inc({ status: "dst_locked" });
-    
+
+    this.audit(buildOrderAuditEntry('order.dst_locked', {
+      orderId: order.publicId,
+      hashlock: order.hashlock,
+      direction: order.direction,
+      fromStatus: order.status,
+      toStatus: 'dst_locked',
+      srcChain: order.srcChain,
+      dstChain: order.dstChain,
+      txHash: input.txHash,
+      blockNumber: input.blockNumber,
+      resolverAddress: input.resolver,
+      requestId: getRequestId(),
+    }));
+
     // Invalidate cache for both addresses since order status changed
     this.historyCache.invalidateAddress(order.srcAddress);
     this.historyCache.invalidateAddress(order.dstAddress);
@@ -182,7 +233,19 @@ export class OrderService {
     await this.repo.recordSecretRevealed({ publicId, preimage, txHash, encVersion });
     this.log.info({ publicId }, "secret recorded");
     ordersTotal.inc({ status: "secret_revealed" });
-    
+
+    this.audit(buildOrderAuditEntry('order.secret_revealed', {
+      orderId: order.publicId,
+      hashlock: order.hashlock,
+      direction: order.direction,
+      fromStatus: order.status,
+      toStatus: 'secret_revealed',
+      srcChain: order.srcChain,
+      dstChain: order.dstChain,
+      txHash,
+      requestId: getRequestId(),
+    }));
+
     // Invalidate cache for both addresses since order status changed
     this.historyCache.invalidateAddress(order.srcAddress);
     this.historyCache.invalidateAddress(order.dstAddress);
@@ -204,7 +267,32 @@ export class OrderService {
     await this.repo.setStatus(publicId, status);
     this.log.info({ publicId, status }, "status updated");
     ordersTotal.inc({ status });
-    
+
+    // Map the new status to the correct audit event type
+    const auditEventMap: Record<string, import('../audit/audit-log.js').AuditEventType> = {
+      completed:       'order.completed',
+      refunded:        'order.refunded',
+      failed:          'order.failed',
+      expired:         'order.expired',
+      src_locked:      'order.src_locked',
+      dst_locked:      'order.dst_locked',
+      secret_revealed: 'order.secret_revealed',
+      announced:       'order.announced',
+    };
+    const auditEvent = auditEventMap[status];
+    if (auditEvent) {
+      this.audit(buildOrderAuditEntry(auditEvent as Parameters<typeof buildOrderAuditEntry>[0], {
+        orderId: order.publicId,
+        hashlock: order.hashlock,
+        direction: order.direction,
+        fromStatus: order.status,
+        toStatus: status,
+        srcChain: order.srcChain,
+        dstChain: order.dstChain,
+        requestId: getRequestId(),
+      }));
+    }
+
     // Invalidate cache for both addresses since order status changed
     this.historyCache.invalidateAddress(order.srcAddress);
     this.historyCache.invalidateAddress(order.dstAddress);
@@ -213,11 +301,33 @@ export class OrderService {
   async rollbackSrcLock(publicId: string): Promise<void> {
     await this.repo.rollbackSrcLock(publicId);
     this.log.warn({ publicId }, "rolled back src lock");
+    this.audit(buildOrderAuditEntry('order.src_lock_rolled_back', {
+      orderId: publicId,
+      hashlock: '',
+      direction: '',
+      fromStatus: 'src_locked',
+      toStatus: 'announced',
+      srcChain: '',
+      dstChain: '',
+      detail: 'reorg or duplicate event triggered rollback',
+      requestId: getRequestId(),
+    }));
   }
 
   async rollbackDstLock(publicId: string): Promise<void> {
     await this.repo.rollbackDstLock(publicId);
     this.log.warn({ publicId }, "rolled back dst lock");
+    this.audit(buildOrderAuditEntry('order.dst_lock_rolled_back', {
+      orderId: publicId,
+      hashlock: '',
+      direction: '',
+      fromStatus: 'dst_locked',
+      toStatus: 'src_locked',
+      srcChain: '',
+      dstChain: '',
+      detail: 'reorg or duplicate event triggered rollback',
+      requestId: getRequestId(),
+    }));
   }
 
   async getLastProcessedBlock(chain: Chain): Promise<number> {
