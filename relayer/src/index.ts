@@ -931,7 +931,7 @@ async function initializeRelayer() {
         const hashLock = ethers.keccak256(secret);
         
         console.log('≡ƒöæ Generated HTLC parameters:', {
-          secret: secret.substring(0, 10) + '...',
+          secret: '[REDACTED]',
           hashLock: hashLock
         });
         
@@ -1166,7 +1166,7 @@ async function initializeRelayer() {
         const hashLock = ethers.keccak256(secret).substring(2); // Remove 0x prefix for Stellar
         
         console.log('≡ƒöæ Generated HTLC parameters for XLMΓåÆETH:', {
-          secret: secret.substring(0, 12) + '...',
+          secret: '[REDACTED]',
           hashLock
         });
 
@@ -1944,7 +1944,7 @@ async function initializeRelayer() {
       try {
         console.log('≡ƒÆ░ REAL MODE: Sending actual ETH transaction');
         console.log('≡ƒöù RPC URL:', rpcUrl);
-        console.log('≡ƒöæ Using real private key:', privateKey.substring(0, 10) + '...');
+        console.log('≡ƒöæ Using relayer key: [REDACTED]');
         
         const provider = new ethers.JsonRpcProvider(rpcUrl);
         const relayerWallet = new ethers.Wallet(privateKey, provider);
@@ -2631,7 +2631,7 @@ async function initializeRelayer() {
           contractAddress: mainnetHTLCAddress
         };
         
-        console.log('≡ƒÄë XLMΓåÆETH swap ready! User can now claim ETH with secret:', orderData.secret.substring(0, 10) + '...');
+        console.log('≡ƒÄë XLMΓåÆETH swap ready! User can now claim ETH (secret is stored server-side, not logged)');
         
       } catch (error) {
         console.error('Γ¥î ETH HTLC creation failed for order:', orderId, error);
