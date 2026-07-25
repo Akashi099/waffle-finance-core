@@ -10,6 +10,7 @@ import { EthereumListener } from "./listeners/ethereum-listener.js";
 import { SorobanListener } from "./listeners/soroban-listener.js";
 import { SolanaListener } from "./listeners/solana-listener.js";
 import { Reconciler } from "./reconciliation/reconciler.js";
+import { CacheVerifier } from "./reconciliation/cache-verifier.js";
 import { StaleCleanupService } from "./services/stale-cleanup.js";
 import { createReadinessChecks } from "./readiness.js";
 import type { StartupPhase } from "./readiness.js";
@@ -219,6 +220,7 @@ async function main(): Promise<void> {
   const quotes = new QuoteService(log);
 
   const reconciler = new Reconciler(cfg, orders, log);
+  const cacheVerifier = new CacheVerifier(cfg, repo, log);
   const staleCleanup = new StaleCleanupService(repo, log);
 
   const app = createApp({
@@ -233,6 +235,7 @@ async function main(): Promise<void> {
       db,
       getReconciliationStatus: () => reconciler.getStatus(),
       getStartupPhase: () => startupPhase,
+      getCacheVerificationStatus: () => cacheVerifier.getStatus(),
     }),
     runReconcile: async () => {
       await reconciler.run();
@@ -276,6 +279,18 @@ async function main(): Promise<void> {
   };
   const staleCleanupInterval = setInterval(runStaleCleanup, cfg.pollIntervalMs * 240);
 
+  // Cache verification runs every ~60 reconciliation cycles (roughly once per
+  // hour at the default 15 s poll interval × 4 multiplier).  It is read-only
+  // and low-cost — it only samples 50 active orders — so running it more
+  // frequently than hourly would provide no additional safety margin.
+  const runCacheVerify = (): void => {
+    cacheVerifier.run().catch((err) => log.warn({ err }, "cache verification failed"));
+  };
+  // Run once shortly after startup (after a brief warm-up delay) so operators
+  // see an initial `cache_alignment` status in the first /readyz response.
+  setTimeout(() => void runCacheVerify(), 30_000);
+  const cacheVerifyInterval = setInterval(runCacheVerify, cfg.pollIntervalMs * 240);
+
   // ── 7. Listeners ────────────────────────────────────────────────────────
   const ethListener = new EthereumListener(cfg, orders, log);
   const sorobanListener = new SorobanListener(cfg, orders, log);
@@ -298,6 +313,7 @@ async function main(): Promise<void> {
     clearInterval(reconcileInterval);
     clearInterval(expiryInterval);
     clearInterval(staleCleanupInterval);
+    clearInterval(cacheVerifyInterval);
     ethListener.stop();
     sorobanListener.stop();
     solanaListener.stop();

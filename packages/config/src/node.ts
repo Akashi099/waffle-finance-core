@@ -11,6 +11,11 @@ import {
   type ResolverConfig,
   type NetworkMode,
 } from "./schema.js";
+import {
+  validateSorobanChainConfig,
+  formatConfigReport,
+  type SorobanChainConfigInput,
+} from "./soroban-chain-config.js";
 
 /**
  * Traverses up from the current directory to find the nearest .env file.
@@ -87,7 +92,53 @@ export function loadCoordinatorConfig(
     },
   };
 
-  return coordinatorConfigSchema.parse(mapped);
+  const cfg = coordinatorConfigSchema.parse(mapped);
+
+  // ── Soroban/chain config contract validation ─────────────────────────────
+  //
+  // Run the typed config contract after Zod parsing so that field shapes are
+  // already validated.  This second pass catches semantic problems: chain ID
+  // mismatch, placeholder contract IDs, passphrase drift, etc.  Errors are
+  // surfaced as a detailed report rather than a raw Zod ZodError so operators
+  // get actionable messages even when they don't have access to the source.
+  const chainInput: SorobanChainConfigInput = {
+    network: cfg.network,
+    soroban: {
+      rpcUrl: cfg.soroban.rpcUrl,
+      horizonUrl: cfg.soroban.horizonUrl,
+      networkPassphrase: cfg.soroban.networkPassphrase,
+      htlcContract: cfg.soroban.htlcContract,
+      resolverRegistry: cfg.soroban.resolverRegistry,
+    },
+    ethereum: {
+      rpcUrl: cfg.ethereum.rpcUrl,
+      chainId: cfg.ethereum.chainId,
+      htlcEscrow: cfg.ethereum.htlcEscrow ?? null,
+      resolverRegistry: cfg.ethereum.resolverRegistry ?? null,
+    },
+    solana: {
+      programId: cfg.solana.programId,
+    },
+  };
+  const chainResult = validateSorobanChainConfig(chainInput);
+
+  // Always print the report at startup so operators can see which chains are
+  // active vs disabled without having to inspect individual env vars.
+  if (!chainResult.ok || chainResult.warnings.length > 0) {
+    console.warn(formatConfigReport(chainResult));
+  }
+
+  if (!chainResult.ok) {
+    const details = chainResult.errors
+      .map((e) => `  [${e.code}] ${e.envVar}: ${e.message}`)
+      .join("\n");
+    throw new Error(
+      `Coordinator configuration rejected by Soroban/chain contract — ` +
+      `${chainResult.errors.length} error(s):\n${details}`
+    );
+  }
+
+  return cfg;
 }
 
 /**
@@ -159,7 +210,51 @@ export function loadRelayerConfig(
     },
   };
 
-  return relayerConfigSchema.parse(mapped);
+  const relayCfg = relayerConfigSchema.parse(mapped);
+
+  // ── Soroban/chain config contract validation ─────────────────────────────
+  // The relayer uses `stellar` (not `soroban`) for its Stellar block.  We
+  // build a minimal SorobanChainConfigInput from the relayer's parsed fields
+  // so the shared validator can check endpoint reachability, passphrase
+  // consistency, and contract address format without duplicating logic here.
+  const relayerChainInput: SorobanChainConfigInput = {
+    network: relayCfg.network,
+    soroban: {
+      rpcUrl: rawEnv.SOROBAN_RPC_URL ??
+        (isMainnet ? "https://mainnet.sorobanrpc.com" : "https://soroban-testnet.stellar.org"),
+      horizonUrl: relayCfg.stellar.horizonUrl,
+      networkPassphrase: relayCfg.stellar.networkPassphrase,
+      // Relayer does not use Soroban contracts directly — optional here.
+      htlcContract: null,
+      resolverRegistry: null,
+    },
+    ethereum: {
+      rpcUrl: relayCfg.ethereum.rpcUrl,
+      chainId: isMainnet ? 1 : 11_155_111,
+      htlcEscrow: rawEnv[isMainnet ? "ETH_HTLC_ESCROW_MAINNET" : "ETH_HTLC_ESCROW_TESTNET"] ?? null,
+      resolverRegistry:
+        rawEnv[isMainnet ? "ETH_RESOLVER_REGISTRY_MAINNET" : "ETH_RESOLVER_REGISTRY_TESTNET"] ?? null,
+    },
+    // Relayer does not interact with Solana directly.
+    solana: { programId: null },
+  };
+  const relayerChainResult = validateSorobanChainConfig(relayerChainInput);
+
+  if (!relayerChainResult.ok || relayerChainResult.warnings.length > 0) {
+    console.warn(formatConfigReport(relayerChainResult));
+  }
+
+  if (!relayerChainResult.ok) {
+    const details = relayerChainResult.errors
+      .map((e) => `  [${e.code}] ${e.envVar}: ${e.message}`)
+      .join("\n");
+    throw new Error(
+      `Relayer configuration rejected by Soroban/chain contract — ` +
+      `${relayerChainResult.errors.length} error(s):\n${details}`
+    );
+  }
+
+  return relayCfg;
 }
 
 /**
@@ -197,5 +292,45 @@ export function loadResolverConfig(
     },
   };
 
-  return resolverConfigSchema.parse(mapped);
+  const resolverCfg = resolverConfigSchema.parse(mapped);
+
+  // ── Soroban/chain config contract validation ─────────────────────────────
+  // Resolver uses `soroban.htlc` (not `htlcContract`) in its own schema but
+  // we map it to the shared validator's field name here so the contract is
+  // applied consistently across all three services.
+  const resolverChainInput: SorobanChainConfigInput = {
+    network: resolverCfg.network,
+    soroban: {
+      rpcUrl: resolverCfg.soroban.rpcUrl,
+      horizonUrl: resolverCfg.soroban.horizonUrl,
+      networkPassphrase: resolverCfg.soroban.networkPassphrase,
+      htlcContract: resolverCfg.soroban.htlc,
+      resolverRegistry: resolverCfg.soroban.resolverRegistry,
+    },
+    ethereum: {
+      rpcUrl: resolverCfg.ethereum.rpcUrl,
+      chainId: resolverCfg.ethereum.chainId,
+      htlcEscrow: resolverCfg.ethereum.htlcEscrow ?? null,
+      resolverRegistry: resolverCfg.ethereum.resolverRegistry ?? null,
+    },
+    // Resolver does not interact with Solana directly.
+    solana: { programId: null },
+  };
+  const resolverChainResult = validateSorobanChainConfig(resolverChainInput);
+
+  if (!resolverChainResult.ok || resolverChainResult.warnings.length > 0) {
+    console.warn(formatConfigReport(resolverChainResult));
+  }
+
+  if (!resolverChainResult.ok) {
+    const details = resolverChainResult.errors
+      .map((e) => `  [${e.code}] ${e.envVar}: ${e.message}`)
+      .join("\n");
+    throw new Error(
+      `Resolver configuration rejected by Soroban/chain contract — ` +
+      `${resolverChainResult.errors.length} error(s):\n${details}`
+    );
+  }
+
+  return resolverCfg;
 }

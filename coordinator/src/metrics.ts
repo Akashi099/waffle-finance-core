@@ -209,6 +209,68 @@ export const sorobanDecodeErrors = new Counter({
   registers: [registry],
 });
 
+// ── Cache verifier metrics ────────────────────────────────────────────────────
+
+/**
+ * Total cache verification runs by result.
+ *
+ * A "run" is one complete pass of the CacheVerifier comparing a sample of
+ * cached coordinator order state against authoritative on-chain evidence.
+ */
+export const cacheVerifierRuns = new Counter({
+  name: "coordinator_cache_verifier_runs_total",
+  help: "Total cache verification runs by result (success|failure|skipped)",
+  labelNames: ["result"] as const,
+  registers: [registry],
+});
+
+/**
+ * Total mismatch events detected by the cache verifier, by chain and mismatch type.
+ *
+ * A mismatch is any discrepancy where the coordinator's DB status for an order
+ * does not agree with the status implied by the on-chain evidence (e.g. DB
+ * says `announced` but chain has an `OrderCreated` event with that hashlock).
+ */
+export const cacheVerifierMismatches = new Counter({
+  name: "coordinator_cache_verifier_mismatches_total",
+  help: "Total cache/chain mismatches detected by the cache verifier, by chain and mismatch type",
+  labelNames: ["chain", "mismatch_type"] as const,
+  registers: [registry],
+});
+
+/**
+ * Number of orders sampled during the most recent cache verification run.
+ *
+ * Allows operators to confirm the verifier is actually checking a non-trivial
+ * sample rather than trivially succeeding because no orders were inspected.
+ */
+export const cacheVerifierSampleSize = new Gauge({
+  name: "coordinator_cache_verifier_sample_size",
+  help: "Number of orders sampled in the most recent cache verification run",
+  registers: [registry],
+});
+
+/**
+ * Unix timestamp of the most recently completed cache verification run.
+ */
+export const cacheVerifierLastRun = new Gauge({
+  name: "coordinator_cache_verifier_last_run_timestamp_seconds",
+  help: "Unix timestamp of the most recent cache verification run",
+  registers: [registry],
+});
+
+/**
+ * Number of mismatches found in the most recent run.
+ *
+ * Exposed as a gauge (not a counter) so an alert can fire when this value is
+ * > 0 after a fresh run, and auto-resolve when the cache re-synchronises.
+ */
+export const cacheVerifierLastRunMismatches = new Gauge({
+  name: "coordinator_cache_verifier_last_run_mismatches",
+  help: "Number of cache/chain mismatches found in the most recent verification run",
+  registers: [registry],
+});
+
 /**
  * Set to 1 when SOLANA_HTLC_PROGRAM is a placeholder and the Solana
  * listener is disabled; 0 when a real program address is configured.

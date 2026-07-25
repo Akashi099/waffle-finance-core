@@ -8,6 +8,7 @@ export { ZodError, z } from "zod";
 export * from "./schema.js";
 export * from "./ethereum-rpc-url.js";
 export * from "./solana-placeholder.js";
+export * from "./soroban-chain-config.js";
 
 /**
  * Validates and loads frontend configuration.

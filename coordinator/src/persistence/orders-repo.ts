@@ -542,6 +542,28 @@ export class OrdersRepository {
     );
   }
 
+  /**
+   * Return up to `limit` non-terminal, non-archived orders ordered by
+   * most recently updated.  Used by the CacheVerifier to select a sample
+   * of active orders for snapshot comparison against on-chain state.
+   *
+   * Terminal statuses (completed, refunded, failed) are excluded because
+   * their on-chain state is immutable and will always agree with the cache.
+   */
+  async findNonTerminalSample(limit: number): Promise<OrderRow[]> {
+    const rows = await this.all<OrderDbRow>(
+      this.db.prepare(`
+        SELECT * FROM orders
+        WHERE status NOT IN ('completed', 'refunded', 'failed')
+          AND archived_at IS NULL
+        ORDER BY updated_at DESC
+        LIMIT ?
+      `),
+      limit
+    );
+    return rows.map(rowToOrder);
+  }
+
   async getLastProcessedBlock(chain: Chain): Promise<number> {
     const srcRow = await this.get<{ max_block: number | null }>(
       this.db.prepare("SELECT MAX(src_lock_block) AS max_block FROM orders WHERE src_chain = ?"),
