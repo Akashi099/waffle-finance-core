@@ -1,4 +1,5 @@
 import type { OrderStatus } from "../persistence/orders-repo.js";
+import { orderInvalidTransitions } from "../metrics.js";
 
 /**
  * Allowed transitions for an order's lifecycle.
@@ -42,6 +43,9 @@ export function canTransition(from: OrderStatus, to: OrderStatus): boolean {
 
 export function requireTransition(from: OrderStatus, to: OrderStatus): void {
   if (!canTransition(from, to)) {
+    // Track invalid transition attempts for observability — a non-zero
+    // rate here indicates a bug in the listener or manual operator action.
+    orderInvalidTransitions.inc({ from, to });
     throw new InvalidTransitionError(from, to);
   }
 }

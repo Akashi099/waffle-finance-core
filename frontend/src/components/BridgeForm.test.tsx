@@ -201,6 +201,36 @@ describe('BridgeForm wallet recovery', () => {
 });
 
 describe('BridgeForm cross-chain validation', () => {
+  it('blocks a Solana route when the connected Solana address is whitespace-only', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({
+        ethUsd: 3500,
+        xlmUsd: 0.12,
+        solUsd: 150,
+        xlmPerEth: 29166,
+        staleness: 'fresh',
+        fetchedAt: Date.now(),
+      }),
+    });
+
+    render(
+      <BridgeForm
+        ethAddress={ETH}
+        stellarAddress={XLM}
+        solanaAddress="   "
+        signStellarTransaction={noopSign}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /ETH\s*→\s*SOL/i }));
+    fireEvent.change(screen.getByPlaceholderText('0.0'), { target: { value: '0.1' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Bridge$/i }));
+
+    expect(await screen.findByText(/Connect Solana wallet/i)).toBeInTheDocument();
+    await flush();
+  });
+
   it('blocks a Solana route when the destination address is not a Solana address', async () => {
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,

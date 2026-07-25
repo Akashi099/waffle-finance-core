@@ -16,6 +16,7 @@ import type { SecretService } from "../services/secret-service.js";
 import type { QuoteService } from "../services/quote-service.js";
 import type { ReconciliationStatus } from "../reconciliation/reconciler.js";
 import type { StaleCleanupResult } from "../services/stale-cleanup.js";
+import type { ExpiryResult } from "./routes/admin.js";
 import { requestIdMiddleware, REQUEST_ID_HEADER } from "./middleware/request-id.js";
 import { AbuseDetector } from "./middleware/abuse-detection.js";
 import { sanitizeForLog } from "../utils/sanitize-for-log.js";
@@ -45,6 +46,12 @@ export interface AppDeps {
    * Omitting this disables the endpoint (the route is not mounted).
    */
   runStaleCleanup?: () => Promise<StaleCleanupResult>;
+  /**
+   * When provided, `POST /admin/expire-now` will trigger an immediate
+   * order-expiry scan and return the count of newly-expired orders.
+   * Omitting this disables the endpoint (the route is not mounted).
+   */
+  runExpiry?: () => Promise<ExpiryResult>;
 }
 
 export function createApp(deps: AppDeps): Express {
@@ -114,7 +121,8 @@ export function createApp(deps: AppDeps): Express {
       adminRoutes({
         log: deps.log,
         runReconcile: deps.runReconcile,
-        runStaleCleanup: deps.runStaleCleanup
+        runStaleCleanup: deps.runStaleCleanup,
+        runExpiry: deps.runExpiry,
       })
     );
   }

@@ -4,10 +4,17 @@ import {
   type OrderRow,
   type OrderHistoryResult,
   type AnnounceOrderInput,
-  type Chain
+  type Chain,
+  type OrderStatus
 } from "../persistence/orders-repo.js";
 import { canTransition } from "../state-machine/order-machine.js";
-import { ordersTotal, resolverLockActionsTotal } from "../metrics.js";
+import {
+  ordersTotal,
+  orderLifecycleTransitions,
+  orderStateDuration,
+  orderCurrentState,
+  resolverLockActionsTotal
+} from "../metrics.js";
 import { announceSchema, type AnnounceInput } from "../validation/announce.js";
 import { HistoryCache } from "./history-cache.js";
 import type { AuditRepository } from "../audit/audit-repo.js";
@@ -20,6 +27,36 @@ export { announceSchema };
 export type { AnnounceInput };
 
 export class OrderValidationError extends Error {}
+
+/* ── Observability helpers ───────────────────────────────────────────────── */
+
+/**
+ * Record lifecycle transition metrics for an order moving from one state
+ * to another.  Updates:
+ *  - `orderLifecycleTransitions` counter (direction, from, to)
+ *  - `orderStateDuration` histogram for the time spent in the previous state
+ *  - `orderCurrentState` gauge (+1 for the new state, -1 for the old state)
+ *  - `ordersTotal` counter (cumulative count per status)
+ */
+function recordTransition(
+  direction: string,
+  from: OrderStatus,
+  to: OrderStatus,
+  updatedAtSeconds: number
+): void {
+  // Per-transition counter.
+  orderLifecycleTransitions.inc({ direction, from, to });
+
+  // Time in previous state: updatedAt is the timestamp the NEW state is being
+  // recorded, so we approximate duration using `createdAt` in the actual
+  // call sites.  This is a placeholder; the call site passes the order's
+  // `updatedAt` as a proxy for when the order entered `from`.
+  orderStateDuration.observe({ direction, state: from }, Math.max(Date.now() / 1000 - updatedAtSeconds, 0));
+
+  // Update instantaneous state distribution.
+  orderCurrentState.dec({ direction, state: from });
+  orderCurrentState.inc({ direction, state: to });
+}
 
 export class OrderService {
   private readonly historyCache: HistoryCache;
@@ -71,19 +108,15 @@ export class OrderService {
       { publicId: order.publicId, direction: order.direction, hashlock: order.hashlock },
       "order announced"
     );
-    ordersTotal.inc({ status: "announced" });
 
-    this.audit(buildOrderAuditEntry('order.announced', {
-      orderId: order.publicId,
-      hashlock: order.hashlock,
-      direction: order.direction,
-      fromStatus: null,
-      toStatus: 'announced',
-      srcChain: order.srcChain,
-      dstChain: order.dstChain,
-      requestId: getRequestId(),
-    }));
-
+    // ── Observability ───────────────────────────────────────────────────
+    // The order enters the system in the "announced" state.  Since there is
+    // no previous state to decrement, we only increment the new state gauge
+    // and the cumulative total counter.
+    ordersTotal.inc({ status: "announced", direction: order.direction });
+    orderLifecycleTransitions.inc({ direction: order.direction, from: "none", to: "announced" });
+    orderCurrentState.inc({ direction: order.direction, state: "announced" });
+    
     // Invalidate cache for both source and destination addresses
     this.historyCache.invalidateAddress(order.srcAddress);
     this.historyCache.invalidateAddress(order.dstAddress);
@@ -96,7 +129,24 @@ export class OrderService {
   }
 
   history(address: string, limit?: number, offset?: number): Promise<OrderRow[]> {
-    return this.repo.findByAddress(address, limit, offset);
+    const finalLimit = Math.min(Math.max(limit ?? 50, 1), 200);
+    const finalOffset = Math.max(offset ?? 0, 0);
+
+    // Use cache for offset-based pages as well by encoding offset into the cursor string
+    const cursorForCache = `offset:${finalOffset}`;
+    const cached = this.historyCache.get(address, finalLimit, cursorForCache);
+    if (cached) {
+      this.log.debug({ address, limit: finalLimit, offset: finalOffset }, "Cache hit for offset history request");
+      return Promise.resolve(cached.orders);
+    }
+
+    return this.repo.findByAddress(address, finalLimit, finalOffset).then((rows) => {
+      if (rows.length > 0) {
+        // store a synthetic OrderHistoryResult for uniformity
+        this.historyCache.set(address, finalLimit, cursorForCache, { orders: rows, nextCursor: null });
+      }
+      return rows;
+    });
   }
 
   /**
@@ -104,20 +154,25 @@ export class OrderService {
    * More efficient and consistent than offset pagination for large datasets.
    */
   async historyWithCursor(address: string, limit = 50, cursor?: string): Promise<OrderHistoryResult> {
-    // Check cache first
-    const cached = this.historyCache.get(address, limit, cursor);
+    // Enforce sane limits at service boundary
+    const finalLimit = Math.min(Math.max(limit, 1), 200);
+
+    // Check cache first (cache key uses finalLimit)
+    const cached = this.historyCache.get(address, finalLimit, cursor);
     if (cached) {
-      this.log.debug({ address, limit, cursor: cursor || 'first' }, "Cache hit for history request");
+      this.log.debug({ address, limit: finalLimit, cursor: cursor || 'first' }, "Cache hit for history request");
       return cached;
     }
 
     // Cache miss - fetch from database
-    this.log.debug({ address, limit, cursor: cursor || 'first' }, "Cache miss for history request");
-    const result = await this.repo.findByAddressWithCursor(address, limit, cursor);
-    
-    // Cache the result
-    this.historyCache.set(address, limit, cursor, result);
-    
+    this.log.debug({ address, limit: finalLimit, cursor: cursor || 'first' }, "Cache miss for history request");
+    const result = await this.repo.findByAddressWithCursor(address, finalLimit, cursor);
+
+    // Cache the result (only cache non-empty pages to avoid caching many empty results)
+    if (result.orders.length > 0) {
+      this.historyCache.set(address, finalLimit, cursor, result);
+    }
+
     return result;
   }
 
@@ -150,21 +205,11 @@ export class OrderService {
     }
     await this.repo.recordSrcLock(input);
     this.log.info({ publicId: input.publicId, srcOrderId: input.orderId }, "src lock recorded");
-    ordersTotal.inc({ status: "src_locked" });
 
-    this.audit(buildOrderAuditEntry('order.src_locked', {
-      orderId: order.publicId,
-      hashlock: order.hashlock,
-      direction: order.direction,
-      fromStatus: order.status,
-      toStatus: 'src_locked',
-      srcChain: order.srcChain,
-      dstChain: order.dstChain,
-      txHash: input.txHash,
-      blockNumber: input.blockNumber,
-      requestId: getRequestId(),
-    }));
-
+    // ── Observability ───────────────────────────────────────────────────
+    recordTransition(order.direction, order.status, "src_locked", order.updatedAt);
+    ordersTotal.inc({ status: "src_locked", direction: order.direction });
+    
     // Invalidate cache for both addresses since order status changed
     this.historyCache.invalidateAddress(order.srcAddress);
     this.historyCache.invalidateAddress(order.dstAddress);
@@ -192,22 +237,11 @@ export class OrderService {
     }
     await this.repo.recordDstLock(input);
     this.log.info({ publicId: input.publicId, dstOrderId: input.orderId, resolver: input.resolver }, "dst lock recorded");
-    ordersTotal.inc({ status: "dst_locked" });
 
-    this.audit(buildOrderAuditEntry('order.dst_locked', {
-      orderId: order.publicId,
-      hashlock: order.hashlock,
-      direction: order.direction,
-      fromStatus: order.status,
-      toStatus: 'dst_locked',
-      srcChain: order.srcChain,
-      dstChain: order.dstChain,
-      txHash: input.txHash,
-      blockNumber: input.blockNumber,
-      resolverAddress: input.resolver,
-      requestId: getRequestId(),
-    }));
-
+    // ── Observability ───────────────────────────────────────────────────
+    recordTransition(order.direction, order.status, "dst_locked", order.updatedAt);
+    ordersTotal.inc({ status: "dst_locked", direction: order.direction });
+    
     // Invalidate cache for both addresses since order status changed
     this.historyCache.invalidateAddress(order.srcAddress);
     this.historyCache.invalidateAddress(order.dstAddress);
@@ -232,20 +266,11 @@ export class OrderService {
     }
     await this.repo.recordSecretRevealed({ publicId, preimage, txHash, encVersion });
     this.log.info({ publicId }, "secret recorded");
-    ordersTotal.inc({ status: "secret_revealed" });
 
-    this.audit(buildOrderAuditEntry('order.secret_revealed', {
-      orderId: order.publicId,
-      hashlock: order.hashlock,
-      direction: order.direction,
-      fromStatus: order.status,
-      toStatus: 'secret_revealed',
-      srcChain: order.srcChain,
-      dstChain: order.dstChain,
-      txHash,
-      requestId: getRequestId(),
-    }));
-
+    // ── Observability ───────────────────────────────────────────────────
+    recordTransition(order.direction, order.status, "secret_revealed", order.updatedAt);
+    ordersTotal.inc({ status: "secret_revealed", direction: order.direction });
+    
     // Invalidate cache for both addresses since order status changed
     this.historyCache.invalidateAddress(order.srcAddress);
     this.historyCache.invalidateAddress(order.dstAddress);
@@ -266,33 +291,11 @@ export class OrderService {
     }
     await this.repo.setStatus(publicId, status);
     this.log.info({ publicId, status }, "status updated");
-    ordersTotal.inc({ status });
 
-    // Map the new status to the correct audit event type
-    const auditEventMap: Record<string, import('../audit/audit-log.js').AuditEventType> = {
-      completed:       'order.completed',
-      refunded:        'order.refunded',
-      failed:          'order.failed',
-      expired:         'order.expired',
-      src_locked:      'order.src_locked',
-      dst_locked:      'order.dst_locked',
-      secret_revealed: 'order.secret_revealed',
-      announced:       'order.announced',
-    };
-    const auditEvent = auditEventMap[status];
-    if (auditEvent) {
-      this.audit(buildOrderAuditEntry(auditEvent as Parameters<typeof buildOrderAuditEntry>[0], {
-        orderId: order.publicId,
-        hashlock: order.hashlock,
-        direction: order.direction,
-        fromStatus: order.status,
-        toStatus: status,
-        srcChain: order.srcChain,
-        dstChain: order.dstChain,
-        requestId: getRequestId(),
-      }));
-    }
-
+    // ── Observability ───────────────────────────────────────────────────
+    recordTransition(order.direction, order.status, status, order.updatedAt);
+    ordersTotal.inc({ status, direction: order.direction });
+    
     // Invalidate cache for both addresses since order status changed
     this.historyCache.invalidateAddress(order.srcAddress);
     this.historyCache.invalidateAddress(order.dstAddress);

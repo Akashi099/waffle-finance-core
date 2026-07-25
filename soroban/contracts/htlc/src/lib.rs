@@ -76,6 +76,9 @@ mod harness;
 #[cfg(test)]
 mod governance;
 
+#[cfg(test)]
+mod prop_tests;
+
 /// Maximum allowed timelock duration in seconds (24 hours).
 /// Mirrors the EVM contract bound and protects users from accidentally
 /// locking funds for unreasonably long periods.

@@ -18,3 +18,4 @@ soroban-sdk = { workspace = true }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 wafflefinance-resolver-registry = { path = "../resolver-registry" }
+proptest = "1.0"

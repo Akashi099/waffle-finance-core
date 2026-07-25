@@ -583,3 +583,7 @@ impl ResolverRegistry {
         admin.require_auth();
     }
 }
+
+
+#[cfg(test)]
+mod prop_tests;
