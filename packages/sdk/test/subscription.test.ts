@@ -100,8 +100,9 @@ afterEach(() => {
 
 async function tickOnce() {
   // The subscriber fires an immediate poll on start() then uses setInterval.
-  // We let the microtask queue flush, then advance time by one interval.
-  await vi.runAllMicrotasksAsync();
+  // Advancing fake timers by 0ms flushes the pending poll's microtask queue
+  // without moving the clock forward.
+  await vi.advanceTimersByTimeAsync(0);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -432,5 +433,103 @@ describe("OrderSubscriber — off()", () => {
 
     expect(events).toHaveLength(0);
     sub.stop();
+  });
+});
+
+// ── Recovery flows ─────────────────────────────────────────────────────────────
+//
+// The tests above cover individual error events in isolation. These cover the
+// end-to-end recovery behaviour that matters to a real consumer: does the
+// subscriber's internal state (lastStatus, lastSecretRevealed) stay correct
+// across a transient outage, so normal events resume firing once the
+// coordinator comes back — rather than double-firing or silently dropping
+// the transition that happened while polls were failing.
+
+describe("OrderSubscriber — recovery", () => {
+  it("resumes firing statusChanged for the transition that happened during the outage", async () => {
+    // Poll 1: announced (establishes baseline). Polls 2-3: network blips.
+    // Poll 4: the coordinator is back AND has advanced to src_locked — the
+    // subscriber must report the announced→src_locked transition, not miss it.
+    let call = 0;
+    const client = makeStubClient(async () => {
+      call++;
+      if (call === 1) return makeWireOrder({ status: "announced" });
+      if (call <= 3) throw new Error("connection reset");
+      return makeWireOrder({ status: "src_locked" });
+    });
+
+    const statusEvents: StatusChangedEvent[] = [];
+    const errorEvents: SubscriptionErrorEvent[] = [];
+    const sub = new OrderSubscriber({
+      coordinatorClient: client,
+      orderId: ORDER_ID,
+      pollIntervalMs: 100,
+      maxConsecutiveErrors: 5,
+    });
+    sub.on("statusChanged", (e) => statusEvents.push(e));
+    sub.on("error", (e) => errorEvents.push(e));
+    sub.start();
+    await tickOnce(); // poll 1: announced, baseline
+
+    vi.advanceTimersByTime(100);
+    await tickOnce(); // poll 2: error
+    vi.advanceTimersByTime(100);
+    await tickOnce(); // poll 3: error
+    vi.advanceTimersByTime(100);
+    await tickOnce(); // poll 4: recovered, now src_locked
+
+    expect(errorEvents).toHaveLength(2);
+    expect(statusEvents).toHaveLength(1);
+    expect(statusEvents[0]).toMatchObject({ from: "announced", to: "src_locked" });
+    expect(sub.isRunning).toBe(true);
+
+    sub.stop();
+  });
+
+  it("reaches settled after recovering from a mid-lifecycle outage", async () => {
+    // A full lifecycle with a failure injected between src_locked and the
+    // terminal state, mirroring a resolver/coordinator hiccup mid-swap.
+    let call = 0;
+    const statuses: Array<"announced" | "src_locked" | "completed"> = [
+      "announced",
+      "src_locked",
+      "src_locked", // will throw instead of returning
+      "completed",
+    ];
+    const client = makeStubClient(async () => {
+      const status = statuses[call]!;
+      call++;
+      if (call === 3) throw new Error("timeout"); // 3rd call (index 2) fails
+      return makeWireOrder({
+        status,
+        secret:
+          status === "completed"
+            ? { revealed: true, preimage: null, revealedTx: "0xreveal" }
+            : { revealed: false, preimage: null, revealedTx: null },
+      });
+    });
+
+    const settled: OrderSettledEvent[] = [];
+    const errors: SubscriptionErrorEvent[] = [];
+    const sub = new OrderSubscriber({
+      coordinatorClient: client,
+      orderId: ORDER_ID,
+      pollIntervalMs: 100,
+      maxConsecutiveErrors: 5,
+    });
+    sub.on("settled", (e) => settled.push(e));
+    sub.on("error", (e) => errors.push(e));
+    sub.start();
+
+    for (let i = 0; i < 4; i++) {
+      if (i > 0) vi.advanceTimersByTime(100);
+      await tickOnce();
+    }
+
+    expect(errors).toHaveLength(1);
+    expect(settled).toHaveLength(1);
+    expect(settled[0]!.finalStatus).toBe("completed");
+    // stopOnTerminal defaults to true.
+    expect(sub.isRunning).toBe(false);
   });
 });

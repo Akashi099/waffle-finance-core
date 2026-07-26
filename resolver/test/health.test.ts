@@ -96,4 +96,40 @@ describe("resolver health endpoints", () => {
       expect.objectContaining({ name: "soroban_config", ok: false })
     );
   });
+
+  it("reports telemetry as inactive with 503 before the supervisor starts", async () => {
+    const { baseUrl } = await start();
+
+    const res = await fetch(`${baseUrl}/telemetry`);
+    const body = await res.json();
+
+    expect(res.status).toBe(503);
+    expect(body.state).toBe("inactive");
+    expect(body.supervisorState).toBe("idle");
+    expect(body.chains).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ chain: "ethereum" }),
+        expect.objectContaining({ chain: "soroban" }),
+      ])
+    );
+  });
+
+  it("reports telemetry as connected once chains report recent events", async () => {
+    const { baseUrl, supervisor } = await start();
+    const runPromise = supervisor.run({ start: () => new Promise(() => {}), stop: async () => {} });
+    void runPromise;
+
+    const { listenerLastEventTimestampSeconds } = await import("../src/metrics.js");
+    const now = Math.floor(Date.now() / 1000);
+    listenerLastEventTimestampSeconds.set({ chain: "ethereum" }, now);
+    listenerLastEventTimestampSeconds.set({ chain: "soroban" }, now);
+
+    const res = await fetch(`${baseUrl}/telemetry`);
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.state).toBe("connected");
+
+    supervisor.stop();
+  });
 });
