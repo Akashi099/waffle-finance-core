@@ -1,5 +1,10 @@
 import { createServer } from "node:http";
 import express from "express";
+import {
+  SupportPolicyValidationError,
+  assertSupportPolicy,
+  supportsAction,
+} from "@wafflefinance/config";
 import { loadConfig } from "../config.js";
 import { validateResolverConfig, ConfigValidationError } from "../validation.js";
 import { getLogger } from "../logger.js";
@@ -7,6 +12,7 @@ import { EthereumListener } from "../listeners/ethereum.js";
 import { SorobanListener } from "../listeners/soroban.js";
 import { Supervisor, FatalError } from "../supervisor.js";
 import { startResolverHealthServer } from "../health.js";
+import { buildSupportPolicy, chainLabel, logSupportPolicy } from "../support.js";
 import { metricsRouter } from "../routes/metrics.js";
 import {
   startTimeSeconds,
@@ -15,8 +21,10 @@ import {
   listenerLastEventTimestampSeconds,
 } from "../metrics.js";
 
-const CHAIN_ETH = "ethereum";
-const CHAIN_SOROBAN = "soroban";
+// Metric labels, derived from the support policy's canonical chain ids so the
+// label strings and the capability checks below cannot drift apart.
+const CHAIN_ETH = chainLabel("ethereum");
+const CHAIN_SOROBAN = chainLabel("stellar");
 
 /**
  * Maximum time in milliseconds the shutdown sequence is allowed to run before
@@ -49,6 +57,29 @@ export async function runCommand(): Promise<void> {
   }
   log.info("resolver configuration validated");
 
+  // ── 2b. Support policy (FATAL when the runtime cannot do any useful work) ──
+  //
+  // The config validator above proves the credentials and endpoints are
+  // *well-formed*.  It does not establish that this deployment can actually
+  // observe a chain or settle a route — a resolver with valid keys but no HTLC
+  // address would previously start, attach both listeners, and never be able to
+  // claim anything.  The support policy makes that capability explicit and
+  // refuses to boot a resolver that could not carry a single route.
+  const policy = buildSupportPolicy(cfg);
+  try {
+    assertSupportPolicy(policy);
+  } catch (err) {
+    if (err instanceof SupportPolicyValidationError) {
+      log.error(
+        { errors: err.errors },
+        "resolver startup aborted: no supported route — check chain configuration"
+      );
+      process.exit(1);
+    }
+    throw err;
+  }
+  logSupportPolicy(policy, log);
+
   // ── 3. Metrics HTTP server ────────────────────────────────────────────────
   const metricsPort = Number(process.env.RESOLVER_METRICS_PORT ?? 3002);
   const metricsApp = express();
@@ -69,9 +100,16 @@ export async function runCommand(): Promise<void> {
     maxRestartDelayMs: 60_000,
   });
 
+  // Report liveness only for chains the policy says we actually observe.  A
+  // hard-coded list reported "stale" for a chain this deployment was never
+  // watching, which reads as a fault rather than as a deliberate limitation.
+  const observedChains = (["ethereum", "stellar"] as const).filter(
+    (chain) => supportsAction(policy, chain, "observe").supported
+  );
+
   const healthPort = Number(process.env.RESOLVER_HEALTH_PORT ?? 3003);
   const healthServer = startResolverHealthServer(
-    { cfg, supervisor, telemetryChains: [CHAIN_ETH, CHAIN_SOROBAN] },
+    { cfg, supervisor, policy, telemetryChains: observedChains.map(chainLabel) },
     healthPort
   );
   log.info({ port: healthPort }, "resolver health server listening");
@@ -176,60 +214,85 @@ export async function runCommand(): Promise<void> {
   // ── 6. Listener set definition ──────────────────────────────────────────
   //
   // The listener set is what the Supervisor restarts on recoverable failure.
-  // `start()` attaches to both chains; `stop()` tears both down cleanly.
-  // Both operations are awaitable so in-flight work can be drained.
+  // `start()` attaches to each chain the policy says we can observe; `stop()`
+  // tears down whatever was started.  Both operations are awaitable so
+  // in-flight work can be drained.
+  //
+  // Attaching was previously unconditional.  Gating on the policy means a chain
+  // the resolver cannot observe is skipped with a logged reason instead of
+  // producing a listener that polls an endpoint it can do nothing with.
+
+  const ethObserve = supportsAction(policy, "ethereum", "observe");
+  const sorobanObserve = supportsAction(policy, "stellar", "observe");
+
+  if (!ethObserve.supported) {
+    log.warn(
+      { chain: CHAIN_ETH, code: ethObserve.code },
+      `Ethereum listener not started: ${ethObserve.reason}`
+    );
+  }
+  if (!sorobanObserve.supported) {
+    log.warn(
+      { chain: CHAIN_SOROBAN, code: sorobanObserve.code },
+      `Soroban listener not started: ${sorobanObserve.reason}`
+    );
+  }
 
   const listeners = {
     async start(): Promise<void> {
-      await eth.start({
-        onOrderCreated: (e) => {
-          log.info(
-            { orderId: e.orderId.toString(), hashlock: e.hashlock, amount: e.amount.toString() },
-            "ETH order created"
-          );
-          ordersProcessedTotal.inc({ chain: CHAIN_ETH, action: "order_created" });
-          listenerLastEventTimestampSeconds.set({ chain: CHAIN_ETH }, Math.floor(Date.now() / 1000));
-        },
-        onOrderClaimed: (e) => {
-          log.info({ orderId: e.orderId.toString(), preimage: e.preimage }, "ETH order claimed");
-          ordersProcessedTotal.inc({ chain: CHAIN_ETH, action: "order_claimed" });
-          listenerLastEventTimestampSeconds.set({ chain: CHAIN_ETH }, Math.floor(Date.now() / 1000));
-        },
-        onOrderRefunded: (e) => {
-          log.info({ orderId: e.orderId.toString() }, "ETH order refunded");
-          ordersProcessedTotal.inc({ chain: CHAIN_ETH, action: "order_refunded" });
-          listenerLastEventTimestampSeconds.set({ chain: CHAIN_ETH }, Math.floor(Date.now() / 1000));
-        },
-      });
+      if (ethObserve.supported) {
+        await eth.start({
+          onOrderCreated: (e) => {
+            log.info(
+              { orderId: e.orderId.toString(), hashlock: e.hashlock, amount: e.amount.toString() },
+              "ETH order created"
+            );
+            ordersProcessedTotal.inc({ chain: CHAIN_ETH, action: "order_created" });
+            listenerLastEventTimestampSeconds.set({ chain: CHAIN_ETH }, Math.floor(Date.now() / 1000));
+          },
+          onOrderClaimed: (e) => {
+            log.info({ orderId: e.orderId.toString(), preimage: e.preimage }, "ETH order claimed");
+            ordersProcessedTotal.inc({ chain: CHAIN_ETH, action: "order_claimed" });
+            listenerLastEventTimestampSeconds.set({ chain: CHAIN_ETH }, Math.floor(Date.now() / 1000));
+          },
+          onOrderRefunded: (e) => {
+            log.info({ orderId: e.orderId.toString() }, "ETH order refunded");
+            ordersProcessedTotal.inc({ chain: CHAIN_ETH, action: "order_refunded" });
+            listenerLastEventTimestampSeconds.set({ chain: CHAIN_ETH }, Math.floor(Date.now() / 1000));
+          },
+        });
+      }
 
-      await stellar.start({
-        onOrderCreated: (e) => {
-          log.info(
-            { orderId: e.orderId, hashlock: e.hashlock, ledger: e.ledger },
-            "Soroban order created"
-          );
-          ordersProcessedTotal.inc({ chain: CHAIN_SOROBAN, action: "order_created" });
-          listenerLastEventTimestampSeconds.set({ chain: CHAIN_SOROBAN }, Math.floor(Date.now() / 1000));
-        },
-        onOrderClaimed: (e) => {
-          log.info(
-            { orderId: e.orderId, preimage: e.preimage, ledger: e.ledger },
-            "Soroban order claimed"
-          );
-          ordersProcessedTotal.inc({ chain: CHAIN_SOROBAN, action: "order_claimed" });
-          listenerLastEventTimestampSeconds.set({ chain: CHAIN_SOROBAN }, Math.floor(Date.now() / 1000));
-        },
-        onOrderRefunded: (e) => {
-          log.info({ orderId: e.orderId, ledger: e.ledger }, "Soroban order refunded");
-          ordersProcessedTotal.inc({ chain: CHAIN_SOROBAN, action: "order_refunded" });
-          listenerLastEventTimestampSeconds.set({ chain: CHAIN_SOROBAN }, Math.floor(Date.now() / 1000));
-        },
-      });
+      if (sorobanObserve.supported) {
+        await stellar.start({
+          onOrderCreated: (e) => {
+            log.info(
+              { orderId: e.orderId, hashlock: e.hashlock, ledger: e.ledger },
+              "Soroban order created"
+            );
+            ordersProcessedTotal.inc({ chain: CHAIN_SOROBAN, action: "order_created" });
+            listenerLastEventTimestampSeconds.set({ chain: CHAIN_SOROBAN }, Math.floor(Date.now() / 1000));
+          },
+          onOrderClaimed: (e) => {
+            log.info(
+              { orderId: e.orderId, preimage: e.preimage, ledger: e.ledger },
+              "Soroban order claimed"
+            );
+            ordersProcessedTotal.inc({ chain: CHAIN_SOROBAN, action: "order_claimed" });
+            listenerLastEventTimestampSeconds.set({ chain: CHAIN_SOROBAN }, Math.floor(Date.now() / 1000));
+          },
+          onOrderRefunded: (e) => {
+            log.info({ orderId: e.orderId, ledger: e.ledger }, "Soroban order refunded");
+            ordersProcessedTotal.inc({ chain: CHAIN_SOROBAN, action: "order_refunded" });
+            listenerLastEventTimestampSeconds.set({ chain: CHAIN_SOROBAN }, Math.floor(Date.now() / 1000));
+          },
+        });
+      }
     },
 
     async stop(): Promise<void> {
-      await eth.stop();
-      stellar.stop();
+      if (ethObserve.supported) await eth.stop();
+      if (sorobanObserve.supported) stellar.stop();
     },
   };
 
