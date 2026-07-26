@@ -287,7 +287,7 @@ describe("toHistoryRecord edge cases", () => {
   it("handles missing optional safetyDeposit on src (null)", () => {
     const wire = makeWireOrder(`wf_${HASHLOCK_A}`, HASHLOCK_A);
     // Remove safetyDeposit to simulate a missing optional field
-    delete (wire.src as Record<string, unknown>)["safetyDeposit"];
+    delete (wire.src as unknown as Record<string, unknown>)["safetyDeposit"];
     const rec = toHistoryRecord(wire);
     expect(rec.src.safetyDeposit).toBeNull();
   });

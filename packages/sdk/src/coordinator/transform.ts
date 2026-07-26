@@ -56,11 +56,7 @@ export function toOrder(wire: CoordinatorOrder): Order {
   };
 }
 
-/**
- * Convert an array of coordinator orders to SDK orders.
- * Null entries (the coordinator never returns nulls in lists, but the
- * typing allows it) are filtered out defensively.
- */
+/** Convert an array of coordinator orders to SDK orders. */
 export function toOrders(wires: CoordinatorOrder[]): Order[] {
   return wires.map(toOrder);
 }

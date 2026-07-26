@@ -10,6 +10,11 @@ import { privateKeyToAccount } from "viem/accounts";
 import { sepolia, mainnet } from "viem/chains";
 import { loadConfig } from "../config.js";
 import { getLogger } from "../logger.js";
+import { retryRpcCall } from "../retry.js";
+import { runResolverCommand } from "../command-runner.js";
+import { registrationInfo, registrationChangesTotal } from "../metrics.js";
+
+const CHAIN_ETH = "ethereum";
 
 const REGISTRY_ABI = parseAbi([
   "function register(uint256 stake)",
@@ -55,91 +60,136 @@ export async function registerCommand(amountInput?: string): Promise<void> {
   const { cfg, log, account, publicClient, walletClient } = ensureEvmContext();
   const registry = cfg.ethereum.resolverRegistry as Address;
 
-  const stakeAsset = (await publicClient.readContract({
-    address: registry,
-    abi: REGISTRY_ABI,
-    functionName: "stakeAsset"
-  })) as Address;
-  const decimals = await publicClient.readContract({
-    address: stakeAsset,
-    abi: ERC20_ABI,
-    functionName: "decimals"
+  return runResolverCommand({ operation: "register", chain: CHAIN_ETH, log }, async () => {
+    // Reads are safe to retry on transient RPC failure — they have no
+    // side effects. Writes below are not retried by this wrapper: retrying
+    // a submitted transaction risks double-submission.
+    const stakeAsset = (await retryRpcCall(
+      () =>
+        publicClient.readContract({
+          address: registry,
+          abi: REGISTRY_ABI,
+          functionName: "stakeAsset"
+        }),
+      { logger: log }
+    )) as Address;
+    const decimals = await retryRpcCall(
+      () =>
+        publicClient.readContract({
+          address: stakeAsset,
+          abi: ERC20_ABI,
+          functionName: "decimals"
+        }),
+      { logger: log }
+    );
+    const symbol = await retryRpcCall(
+      () =>
+        publicClient.readContract({
+          address: stakeAsset,
+          abi: ERC20_ABI,
+          functionName: "symbol"
+        }),
+      { logger: log }
+    );
+
+    const minStake = (await retryRpcCall(
+      () =>
+        publicClient.readContract({
+          address: registry,
+          abi: REGISTRY_ABI,
+          functionName: "minStake"
+        }),
+      { logger: log }
+    )) as bigint;
+
+    const stake = amountInput
+      ? parseUnits(amountInput, decimals as number)
+      : minStake;
+
+    if (stake < minStake) {
+      throw new Error(`Stake ${stake} is below minimum ${minStake}`);
+    }
+
+    log.info({ stakeAsset, symbol, stake: stake.toString() }, "approving stake transfer");
+    const approveTx = await walletClient.writeContract({
+      address: stakeAsset,
+      abi: ERC20_ABI,
+      functionName: "approve",
+      args: [registry, stake]
+    });
+    await publicClient.waitForTransactionReceipt({ hash: approveTx });
+
+    log.info({ stake: stake.toString() }, "calling registry.register");
+    const tx = await walletClient.writeContract({
+      address: registry,
+      abi: REGISTRY_ABI,
+      functionName: "register",
+      args: [stake]
+    });
+    const receipt = await publicClient.waitForTransactionReceipt({ hash: tx });
+    log.info({ tx, gasUsed: receipt.gasUsed.toString() }, "registered as resolver");
+    log.info(`Resolver ${account.address} is now registered with ${stake} ${symbol}.`);
+
+    registrationInfo.set(1);
+    registrationChangesTotal.inc({ action: "register" });
   });
-  const symbol = await publicClient.readContract({
-    address: stakeAsset,
-    abi: ERC20_ABI,
-    functionName: "symbol"
-  });
-
-  const minStake = (await publicClient.readContract({
-    address: registry,
-    abi: REGISTRY_ABI,
-    functionName: "minStake"
-  })) as bigint;
-
-  const stake = amountInput
-    ? parseUnits(amountInput, decimals as number)
-    : minStake;
-
-  if (stake < minStake) {
-    throw new Error(`Stake ${stake} is below minimum ${minStake}`);
-  }
-
-  log.info({ stakeAsset, symbol, stake: stake.toString() }, "approving stake transfer");
-  const approveTx = await walletClient.writeContract({
-    address: stakeAsset,
-    abi: ERC20_ABI,
-    functionName: "approve",
-    args: [registry, stake]
-  });
-  await publicClient.waitForTransactionReceipt({ hash: approveTx });
-
-  log.info({ stake: stake.toString() }, "calling registry.register");
-  const tx = await walletClient.writeContract({
-    address: registry,
-    abi: REGISTRY_ABI,
-    functionName: "register",
-    args: [stake]
-  });
-  const receipt = await publicClient.waitForTransactionReceipt({ hash: tx });
-  log.info({ tx, gasUsed: receipt.gasUsed.toString() }, "registered as resolver");
-  log.info(`Resolver ${account.address} is now registered with ${stake} ${symbol}.`);
 }
 
 export async function statusCommand(): Promise<void> {
   const { cfg, log, account, publicClient } = ensureEvmContext();
   const registry = cfg.ethereum.resolverRegistry as Address;
 
-  const [info, active, minStake] = await Promise.all([
-    publicClient.readContract({
-      address: registry,
-      abi: REGISTRY_ABI,
-      functionName: "get",
-      args: [account.address]
-    }),
-    publicClient.readContract({
-      address: registry,
-      abi: REGISTRY_ABI,
-      functionName: "isActive",
-      args: [account.address]
-    }),
-    publicClient.readContract({
-      address: registry,
-      abi: REGISTRY_ABI,
-      functionName: "minStake"
-    })
-  ]);
-  log.info({ info, active, minStake: (minStake as bigint).toString() }, "resolver status");
+  return runResolverCommand({ operation: "status", chain: CHAIN_ETH, log }, async () => {
+    const [info, active, minStake] = await Promise.all([
+      retryRpcCall(
+        () =>
+          publicClient.readContract({
+            address: registry,
+            abi: REGISTRY_ABI,
+            functionName: "get",
+            args: [account.address]
+          }),
+        { logger: log }
+      ),
+      retryRpcCall(
+        () =>
+          publicClient.readContract({
+            address: registry,
+            abi: REGISTRY_ABI,
+            functionName: "isActive",
+            args: [account.address]
+          }),
+        { logger: log }
+      ),
+      retryRpcCall(
+        () =>
+          publicClient.readContract({
+            address: registry,
+            abi: REGISTRY_ABI,
+            functionName: "minStake"
+          }),
+        { logger: log }
+      )
+    ]);
+    registrationInfo.set(active ? 1 : 0);
+    log.info({ info, active, minStake: (minStake as bigint).toString() }, "resolver status");
+  });
 }
 
 export async function unregisterCommand(): Promise<void> {
   const { cfg, log, account, publicClient, walletClient } = ensureEvmContext();
   const registry = cfg.ethereum.resolverRegistry as Address;
-  const tx = await walletClient.writeContract({
-    address: registry,
-    abi: REGISTRY_ABI,
-    functionName: "unregister"
+
+  return runResolverCommand({ operation: "unregister", chain: CHAIN_ETH, log }, async () => {
+    const tx = await walletClient.writeContract({
+      address: registry,
+      abi: REGISTRY_ABI,
+      functionName: "unregister"
+    });
+    await publicClient.waitForTransactionReceipt({ hash: tx });
+    log.info({ tx, resolver: account.address }, "unregistered");
+
+    registrationInfo.set(0);
+    registrationChangesTotal.inc({ action: "unregister" });
   });
-  await publicClient.waitForTransactionReceipt({ hash: tx });
-  log.info({ tx, resolver: account.address }, "unregistered");
 }
