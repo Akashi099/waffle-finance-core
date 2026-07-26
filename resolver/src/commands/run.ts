@@ -8,6 +8,7 @@ import { SorobanListener } from "../listeners/soroban.js";
 import { Supervisor, FatalError } from "../supervisor.js";
 import { startResolverHealthServer } from "../health.js";
 import { metricsRouter } from "../routes/metrics.js";
+import { ResolverStatusMonitor, DEFAULT_STATUS_POLL_INTERVAL_MS } from "../registry-status.js";
 import {
   startTimeSeconds,
   ordersProcessedTotal,
@@ -69,8 +70,17 @@ export async function runCommand(): Promise<void> {
     maxRestartDelayMs: 60_000,
   });
 
+  // Registration/stake/slash operational policy — see registry-status.ts and
+  // docs/operational-policy.md. Polls each configured registry far less
+  // often than the order listeners since stake status changes rarely.
+  const statusPollMs = Number(
+    process.env.RESOLVER_STATUS_POLL_INTERVAL_MS ?? DEFAULT_STATUS_POLL_INTERVAL_MS
+  );
+  const registryStatus = new ResolverStatusMonitor(cfg, log, { intervalMs: statusPollMs });
+  registryStatus.start();
+
   const healthPort = Number(process.env.RESOLVER_HEALTH_PORT ?? 3003);
-  const healthServer = startResolverHealthServer({ cfg, supervisor }, healthPort);
+  const healthServer = startResolverHealthServer({ cfg, supervisor, registryStatus }, healthPort);
   log.info({ port: healthPort }, "resolver health server listening");
 
   // ── 5. Signal handlers ───────────────────────────────────────────────────
@@ -111,6 +121,7 @@ export async function runCommand(): Promise<void> {
 
     // Tell the supervisor to stop and cancel any pending restart sleep.
     supervisor.stop();
+    registryStatus.stop();
 
     // Stop listeners concurrently.  Each stop is independently try-caught so
     // one failure doesn't prevent the other from being cleaned up.

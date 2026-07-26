@@ -3,6 +3,11 @@
 This document defines the rules for authoring, deploying, and rolling back
 database schema changes in the WaffleFinance coordinator.
 
+For the canonical per-table field/index/constraint contract — i.e. what the
+schema is expected to look like, and when additive changes, backfills, or
+soft-deletes are allowed — see [`schema-contract.md`](./schema-contract.md).
+This document covers *process*; that one covers *shape*.
+
 ---
 
 ## Overview
@@ -29,7 +34,13 @@ NNN_short_description_postgres.sql   # optional Postgres-specific DDL
 ```
 
 - `NNN` is a **zero-padded 3-digit sequence number** (`001`, `002`, …).
-- Numbers must be contiguous and must not be reused.
+- Numbers must be contiguous and must not be reused, with one documented
+  exception: `005_cursor_pagination.sql` and `005_schema_migrations.sql` share
+  the prefix `005` because both were authored concurrently before this policy
+  existed. They are disambiguated by the exact file name, in the fixed order
+  both migration-array constants declare, and are informally called `005a`
+  and `005b` in this document. **New migrations must not repeat this
+  pattern** — always take the next unused numeric prefix.
 - The Postgres variant (`*_postgres.sql`) is only needed when the DDL syntax
   genuinely differs from SQLite (e.g. `ALTER TABLE … DROP CONSTRAINT`).  When
   a Postgres-specific file is absent, the runner falls back to the generic file.
@@ -200,6 +211,7 @@ INSERT INTO … ON CONFLICT DO NOTHING;
 | 005a    | `005_cursor_pagination.sql`    | Cursor-pagination composite indexes on (created_at, id)      |
 | 005b    | `005_schema_migrations.sql`    | Creates `schema_migrations` audit table                      |
 | 006     | `006_stale_cleanup.sql`        | Adds `archived_at` column for soft-delete of stale orders    |
+| 007     | `007_audit_log.sql`            | Creates append-only `audit_log` table for lifecycle forensics |
 
 ---
 

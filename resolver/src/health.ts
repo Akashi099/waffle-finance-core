@@ -1,6 +1,7 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
 import type { ResolverConfig } from "./config.js";
 import type { Supervisor } from "./supervisor.js";
+import type { ResolverStatusMonitor } from "./registry-status.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -8,6 +9,13 @@ export interface ResolverHealthDeps {
   cfg: ResolverConfig;
   supervisor: Supervisor;
   startedAt?: number;
+  /**
+   * Optional — when provided, readiness also reflects this resolver's own
+   * registration/stake/slash standing (see registry-status.ts). Omitted in
+   * tests/deployments that don't wire registry monitoring; readiness then
+   * falls back to config-presence checks only.
+   */
+  registryStatus?: ResolverStatusMonitor;
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -33,7 +41,7 @@ function servicePayload(startedAt: number) {
  * complete in microseconds and never block a health probe.
  */
 function readinessChecks(deps: ResolverHealthDeps) {
-  const { cfg, supervisor } = deps;
+  const { cfg, supervisor, registryStatus } = deps;
 
   const ethOk = Boolean(cfg.ethereum.htlcEscrow && cfg.ethereum.resolverPrivateKey);
   const sorobanOk = Boolean(cfg.soroban.htlc && cfg.soroban.resolverSecret);
@@ -51,7 +59,7 @@ function readinessChecks(deps: ResolverHealthDeps) {
     supervisorState === "stopping" ||
     supervisorState === "stopped";
 
-  return [
+  const checks = [
     {
       name: "ethereum_config",
       ok: ethOk,
@@ -68,6 +76,21 @@ function readinessChecks(deps: ResolverHealthDeps) {
       detail: supervisorState,
     },
   ];
+
+  // Registry status: not-ready when this resolver's own on-chain standing on
+  // any tracked chain is low_stake / slashed / unbonding / inactive. A chain
+  // that has never been probed (registry not configured for it) reports
+  // ok=true — see ResolverStatusMonitor.isReady().
+  if (registryStatus) {
+    const ready = registryStatus.isReady();
+    checks.push({
+      name: "registry_status",
+      ok: ready,
+      detail: ready ? "active" : "degraded",
+    });
+  }
+
+  return checks;
 }
 
 // ── Server factory ────────────────────────────────────────────────────────────
