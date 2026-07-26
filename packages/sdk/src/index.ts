@@ -11,6 +11,59 @@ export type {
   ExternalBridgeAdapter,
 } from "./types/index.js";
 
+// Route-identity registry — single source of truth for supported routes
+export {
+  // axes
+  ROUTE_CHAIN_DIRECTIONS,
+  ROUTE_DIRECTIONS,
+  LIVE_ROUTE_DIRECTIONS,
+  LIVE_DIRECTION_CHAINS,
+  SUPPORTED_CHAINS,
+  TOKEN_GROUPS,
+  BRIDGE_MODES,
+  DEFAULT_BRIDGE_MODE,
+  QUOTE_MODELS,
+  // registry
+  ROUTE_REGISTRY,
+  ROUTE_IDS,
+  // serialisation
+  formatRouteId,
+  parseRouteId,
+  isRouteId,
+  // lookup + validation
+  getRoute,
+  resolveRoute,
+  isSupportedRoute,
+  assertSupportedRoute,
+  UnknownRouteError,
+  // discovery
+  listRoutes,
+  listRoutesForNetwork,
+  chainsForDirection,
+  directionForChains,
+  isLiveDirection,
+  networksForRoute,
+  isRouteOnNetwork,
+  // asset + order identity
+  tokenGroupForAsset,
+  routeIdForOrder,
+  sameRoute,
+} from "./routes/index.js";
+export type {
+  LiveRouteDirection,
+  TokenGroup,
+  BridgeMode,
+  QuoteModel,
+  RouteId,
+  RouteIdParts,
+  RouteStatus,
+  RouteDefinition,
+  RouteSelector,
+  RouteFilter,
+  RouteIdentitySource,
+  UnknownRouteReason,
+} from "./routes/index.js";
+
 // Shared HTLC interface + error types
 export {
   HTLCError,
