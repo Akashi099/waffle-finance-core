@@ -27,6 +27,22 @@ import {
   buildFallbackRecord,
   type OrderSubmissionFailure,
 } from '../../lib/orderSubmissionFallback';
+import {
+  createQuote,
+  validateQuote,
+  serializeQuote,
+  clearPersistedQuote,
+  type BridgeQuote,
+  type SupportedChain,
+} from '../../lib/quoteModel';
+import {
+  createIdleState,
+  transition,
+  persistState as persistMachineState,
+  recoverState,
+  isSubmitting as machineIsSubmitting,
+  type SubmissionState,
+} from '../../lib/submissionStateMachine';
 
 export interface BridgeFormProps {
   ethAddress: string;
@@ -241,6 +257,13 @@ const API_BASE_URL = import.meta.env.PROD
   : import.meta.env.VITE_API_BASE_URL || PRODUCTION_API_BASE_URL;
 const ENABLE_MOCK_DATA = import.meta.env.VITE_ENABLE_MOCK_DATA === 'true';
 
+function directionToChains(dir: BridgeDirection): { srcChain: SupportedChain; dstChain: SupportedChain } {
+  const parts = dir.split('_to_');
+  const resolve = (s: string): SupportedChain =>
+    s === 'eth' ? 'ethereum' : s === 'xlm' ? 'stellar' : 'solana';
+  return { srcChain: resolve(parts[0]), dstChain: resolve(parts[1]) };
+}
+
 export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, signStellarTransaction }: BridgeFormProps): React.JSX.Element {
   const {
     direction,
@@ -298,6 +321,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
       clearInterval(interval);
     };
   }, []);
+
   const [estimatedAmount, setEstimatedAmount] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [orderCreated, setOrderCreated] = useState(false);
@@ -306,7 +330,40 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
   const [balance, setBalance] = useState<string>('0');
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
   const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
+  // Active quote — created each time prices are fetched. Validated before submission.
+  const [activeQuote, setActiveQuote] = useState<BridgeQuote | null>(null);
+  // Submission state machine — tracks the submission lifecycle for recovery.
+  const [submissionMachineState, setSubmissionMachineState] = useState<SubmissionState>(
+    () => recoverState() ?? createIdleState(),
+  );
+  // Deduplication guard: prevents a second concurrent submission if the user
+  // double-clicks while the async handler is already in flight.
+  const isSubmittingRef = useRef(false);
   const prevEthRef = useRef(ethAddress);
+
+  // Show a recovery notice if the component mounts with a recovered in-flight
+  // submission from a previous page session. The user can then check their
+  // transaction history rather than re-submitting a potentially orphaned order.
+  useEffect(() => {
+    if (machineIsSubmitting(submissionMachineState) || submissionMachineState.phase === 'recovery_needed') {
+      const orderSuffix = submissionMachineState.orderId
+        ? ` (order ${submissionMachineState.orderId.substring(0, 10)}…)`
+        : '';
+      setRecoveryNotice(
+        `A previous submission${orderSuffix} was interrupted. Check Transaction History for its status before retrying.`,
+      );
+      // Reset the machine so the form is usable again.
+      setSubmissionMachineState(createIdleState());
+      persistMachineState(createIdleState());
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // intentionally runs once on mount only
+
+  // Persist the machine state to sessionStorage whenever it changes so that a
+  // page reload can detect an orphaned in-flight submission.
+  useEffect(() => {
+    persistMachineState(submissionMachineState);
+  }, [submissionMachineState]);
   const prevStellarRef = useRef(stellarAddress);
   const prevSolanaRef = useRef(solanaAddress ?? '');
   
@@ -395,10 +452,10 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           console.warn('XLM balance fetch failed:', classifyRpcError(err).category, classifyRpcError(err).message);
           setBalance('0');
         }
-      } else if (src.symbol === 'SOL' && solanaAddress) {
+      } else if (src.symbol === 'SOL' && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test((solanaAddress ?? '').trim())) {
         setBalance('Loading...');
         try {
-          setBalance(await fetchSolBalance(solanaAddress));
+          setBalance(await fetchSolBalance(solanaAddress!));
         } catch (err) {
           console.warn('SOL balance fetch failed:', classifyRpcError(err).category, classifyRpcError(err).message);
           setBalance('0');
@@ -425,7 +482,10 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
 
     let cancelled = false;
 
-    const computeWith = (prices: { ethUsd: number; xlmUsd: number; solUsd: number }) => {
+    const computeWith = (
+      prices: { ethUsd: number; xlmUsd: number; solUsd: number },
+      staleness: 'fresh' | 'stale' | 'fallback',
+    ) => {
       const inputAmount = parseFloat(amount);
       const from = DIRECTION_MAP[direction].from.symbol;
       const to   = DIRECTION_MAP[direction].to.symbol;
@@ -439,7 +499,25 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
 
       const outputAmount = (inputAmount * fromUsd) / toUsd;
       const decimals = to === 'ETH' || to === 'SOL' ? 6 : 2;
-      setEstimatedAmount(outputAmount.toFixed(decimals));
+      const estimatedTo = outputAmount.toFixed(decimals);
+      setEstimatedAmount(estimatedTo);
+
+      // Create a normalised, serializable quote that captures the current route
+      // and price. Submission validation will reject this quote if it expires
+      // or if the user switches chains before clicking Bridge.
+      const { srcChain, dstChain } = directionToChains(direction);
+      const quote = createQuote({
+        srcChain,
+        dstChain,
+        fromAsset: { chain: srcChain, symbol: from, decimals: DIRECTION_MAP[direction].from.decimals },
+        toAsset:   { chain: dstChain, symbol: to,   decimals: DIRECTION_MAP[direction].to.decimals   },
+        fromAmount: amount,
+        estimatedToAmount: estimatedTo,
+        exchangeRate: from === 'ETH' && to === 'XLM' ? prices.ethUsd / prices.xlmUsd : outputAmount / inputAmount,
+        priceStateness: staleness,
+      });
+      setActiveQuote(quote);
+      serializeQuote(quote);
     };
 
     const updateRateAndCalculate = async () => {
@@ -464,9 +542,10 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
         setExchangeRate(xlmPerEth);
         setEthUsdPrice(ethUsd);
         setXlmUsdPrice(xlmUsd);
-        setPriceStaleness(body?.staleness ?? 'fresh');
+        const resolvedStaleness = (body?.staleness as 'fresh' | 'stale' | 'fallback') ?? 'fresh';
+        setPriceStaleness(resolvedStaleness);
         setRateLastUpdated(new Date(body?.fetchedAt ?? Date.now()));
-        computeWith({ ethUsd, xlmUsd, solUsd });
+        computeWith({ ethUsd, xlmUsd, solUsd }, resolvedStaleness);
       } catch (err) {
         if (cancelled) return;
         console.warn('Falling back to hardcoded rate:', err);
@@ -475,7 +554,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
         setXlmUsdPrice(null);
         setPriceStaleness('fallback');
         setRateLastUpdated(new Date());
-        computeWith({ ethUsd: 3500, xlmUsd: 0.35, solUsd: 150 });
+        computeWith({ ethUsd: 3500, xlmUsd: 0.35, solUsd: 150 }, 'fallback');
       } finally {
         if (!cancelled) setIsLoadingRate(false);
       }
@@ -545,6 +624,10 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
     });
     setAmount('');
     setEstimatedAmount('');
+    // Invalidate the current quote — the new direction produces a different route
+    // so the existing quote cannot be applied to the reversed order.
+    setActiveQuote(null);
+    clearPersistedQuote();
   };
 
   // Form gönderimi - RELAYER API ÜZERİNDEN
@@ -552,8 +635,12 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
     e.preventDefault();
     setValidationErrors({});
 
+    // Deduplication guard: the async handler may still be running from a
+    // previous click if the user double-taps. Do not start a second flight.
+    if (isSubmittingRef.current) return;
+
     const errors: Record<string, string> = {};
-    const routeResult = validateRouteWallets(direction, ethAddress, stellarAddress, solanaAddress ?? '');
+    const routeResult = validateRouteWallets(direction, ethAddress, stellarAddress, (solanaAddress ?? '').trim());
     const assetPairResult = validateAssetPair(fromToken.symbol, toToken.symbol);
     const amountResult = validateAmount(amount, fromToken.decimals);
     const balanceResult = validateBalance(amount, balance, fromToken.symbol);
@@ -568,10 +655,23 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
     if (!balanceResult.isValid) errors.amount = balanceResult.message;
     if (!destinationResult.isValid) errors.destination = destinationResult.message;
 
+    // Validate the active quote. A missing or expired quote means the price
+    // feed has not yet returned a fresh rate for the current input; a chain
+    // mismatch means the user changed the route after the last price fetch.
+    const { srcChain, dstChain } = directionToChains(direction);
+    const quoteCheck = validateQuote(activeQuote, srcChain, dstChain, amount);
+    if (!quoteCheck.valid) {
+      errors.quote = quoteCheck.message ?? 'Quote is not available. Please wait for the rate to load.';
+    }
+
     if (Object.keys(errors).length > 0) {
       setValidationErrors(errors);
       return;
     }
+
+    // Mark submission in-flight and persist so a reload can detect it.
+    isSubmittingRef.current = true;
+    setSubmissionMachineState((prev) => transition(prev, { type: 'SUBMIT' }));
     
     // Log transaction details
     console.log('🚀 Transaction Started:', { 
@@ -701,7 +801,10 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
       }
       
         result = await response.json();
-      console.log('✅ Order created via relayer:', result);
+        console.log('✅ Order created via relayer:', result);
+        setSubmissionMachineState((prev) =>
+          transition(prev, { type: 'COORDINATOR_ACCEPTED', orderId: result.orderId ?? '' })
+        );
 
             } else {
         // MAINNET: Relayer handles 1inch integration
@@ -727,6 +830,9 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
         
         result = await response.json();
         console.log('✅ Mainnet order created via relayer:', result);
+        setSubmissionMachineState((prev) =>
+          transition(prev, { type: 'COORDINATOR_ACCEPTED', orderId: result.orderId ?? '' })
+        );
       }
       } // end if (!isSolanaDirection)
       
@@ -926,6 +1032,11 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           const isSuccess = receipt.status === '0x1';
           console.log('📋 Transaction status:', receipt.status, isSuccess ? '✅ SUCCESS' : '❌ FAILED');
           
+          // ETH tx confirmed on-chain — advance the machine.
+          setSubmissionMachineState((prev) =>
+            transition(prev, { type: 'CHAIN_LOCK_DETECTED', txHash })
+          );
+
           // Save transaction to history immediately when ETH tx confirms (or fails)
           saveTransactionToHistory({
             orderId: result.orderId,
@@ -973,7 +1084,8 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           
           // Update status to cross-chain processing
           setStatusMessage('Bridging...');
-          
+          setSubmissionMachineState((prev) => transition(prev, { type: 'SETTLE_PENDING' }));
+
           // Show success with transaction hash
           setOrderId(txHash);
           setOrderCreated(true);
@@ -1019,7 +1131,11 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
               
               console.log('🎉 Cross-Chain Bridge Completed!');
               console.log('📋 Stellar TX:', processResult.stellarTxId);
-              
+
+              setSubmissionMachineState((prev) =>
+                transition(prev, { type: 'COMPLETED', orderId: result.orderId ?? txHash, txHash })
+              );
+
               // Update status to completed
               setStatusMessage('Tamamlandı ✅');
               setIsSubmitting(false);
@@ -1363,7 +1479,11 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           status: 'pending',
         });
 
-        setOrderId(announced.publicId ?? announced.orderId);
+        const announcedId = announced.publicId ?? announced.orderId ?? `sol-${Date.now()}`;
+        setSubmissionMachineState((prev) =>
+          transition(prev, { type: 'COMPLETED', orderId: announcedId, txHash: announcedId })
+        );
+        setOrderId(announcedId);
         setOrderCreated(true);
         setStatusMessage('Order announced ✅');
         setIsSubmitting(false);
@@ -1386,11 +1506,11 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
       
     } catch (error: any) {
       console.error('❌ Error creating order:', error);
-      
+
       // Route through the typed fallback contract so the failure is
       // always structured — never a silent no-op.
       const submissionFailure: OrderSubmissionFailure = classifyProviderError(error);
-      
+
       // Write a fallback record to history so TransactionHistory shows an
       // explicit entry for this failed attempt.
       const fallbackRecord = buildFallbackRecord(submissionFailure, {
@@ -1407,11 +1527,16 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
         dstAddress: direction.endsWith('eth') ? ethAddress : (stellarAddress || solanaAddress || ''),
       });
       saveFallbackToHistory(fallbackRecord);
-      
+
+      setSubmissionMachineState((prev) =>
+        transition(prev, { type: 'FAILURE', errorCode: submissionFailure.code, message: submissionFailure.message, retryable: submissionFailure.retryable })
+      );
+
       // Show a clear, user-readable message.
       alert(submissionFailure.message);
     } finally {
       setIsSubmitting(false);
+      isSubmittingRef.current = false;
     }
   };
 
@@ -1421,6 +1546,9 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
     setEstimatedAmount('');
     setOrderCreated(false);
     setOrderId(null);
+    setActiveQuote(null);
+    clearPersistedQuote();
+    setSubmissionMachineState(createIdleState());
     // Also clear the persisted draft so a successful swap is followed by a
     // truly fresh form on the next visit.
     clearPersistedDraft();
@@ -1518,11 +1646,13 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
                   aria-disabled={isDisabled}
                   title={unsupportedReason ?? undefined}
                   onClick={() => {
-                    if (!unsupportedReason) {
+                    if (!unsupportedReason && direction !== d) {
                       setDirection(d);
                       setAmount('');
                       setEstimatedAmount('');
                       setValidationErrors({});
+                      setActiveQuote(null);
+                      clearPersistedQuote();
                     }
                   }}
                   className={`flex-1 rounded-lg px-2 py-1.5 text-[0.65rem] font-semibold transition ${
@@ -1542,6 +1672,9 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           </div>
           {validationErrors.route && (
             <p className="mt-1.5 text-xs text-red-300">{validationErrors.route}</p>
+          )}
+          {validationErrors.quote && (
+            <p className="mt-1.5 text-xs text-amber-300" role="alert">{validationErrors.quote}</p>
           )}
 
           {/* From Section */}
