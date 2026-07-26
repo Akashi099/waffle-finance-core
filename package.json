@@ -36,6 +36,7 @@
     "frontend:build": "pnpm --filter @wafflefinance/frontend build",
     "frontend:preview": "pnpm --filter @wafflefinance/frontend preview",
     "health:check": "curl -s http://localhost:3001/health | jq .",
+    "validate:commands": "node scripts/validate-commands.mjs",
     "validate:manifests": "node scripts/validate-workspace.mjs",
     "validate:deployments": "node scripts/validate-deployments.mjs",
     "validate:deps": "node scripts/check-dep-versions.mjs",

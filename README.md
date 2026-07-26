@@ -129,6 +129,10 @@ frontend/           React + Vite dApp (Ethereum · Stellar · Solana)
 e2e/                Cross-chain differential test harness
 ```
 
+The supported build, test, lint, and smoke-test entry points for every
+package are documented in [docs/COMMANDS.md](docs/COMMANDS.md) — start there
+to find the right command for the package you're touching.
+
 ---
 
 ## Quick start
