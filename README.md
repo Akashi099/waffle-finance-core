@@ -170,6 +170,14 @@ See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for deployment checklists, incide
 
 See [`docs/TECHNICAL_DEBT.md`](docs/TECHNICAL_DEBT.md) for the service-level technical debt register and roadmap — architectural gaps, known limitations, and planned improvements across all services.
 
+See [`docs/QUALITY_GATE.md`](docs/QUALITY_GATE.md) for the contract that keeps code, runtime config, and docs in sync — including a running list of drift found in the repo.
+
+See [`docs/DEPLOYMENT_ROLLBACK_RUNBOOK.md`](docs/DEPLOYMENT_ROLLBACK_RUNBOOK.md) for the rollback-first deployment procedure for the coordinator and relayer.
+
+See [`docs/RELEASE_CONTRACT.md`](docs/RELEASE_CONTRACT.md) for the typed build/release contract covering every package, including known gaps in local release verification.
+
+See [`docs/SMOKE_TEST_CONTRACT.md`](docs/SMOKE_TEST_CONTRACT.md) for the repo-wide smoke test contract spanning coordinator readiness, order announcement, SDK init, and the frontend entry point.
+
 ---
 
 ## Wallet support

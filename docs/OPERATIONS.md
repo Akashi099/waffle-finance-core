@@ -2,6 +2,8 @@
 
 This document provides operational guidance for deploying, monitoring, and troubleshooting WaffleFinance services.
 
+For a rollback-first, step-by-step procedure specific to redeploying the coordinator and relayer (config changes, restart verification, secret rotation, rollback triggers), see [docs/DEPLOYMENT_ROLLBACK_RUNBOOK.md](DEPLOYMENT_ROLLBACK_RUNBOOK.md), which builds on the Rollback Procedures and Monitoring Guide sections below.
+
 ---
 
 ## Table of Contents
