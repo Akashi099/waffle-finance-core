@@ -1,0 +1,23 @@
+name: Command Contract
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    name: Validate command contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The checker is a dependency-free Node script, so no pnpm install is
+      # needed — this job stays fast and can't be broken by a registry
+      # outage.
+      - name: Validate command contract (docs/COMMANDS.md)
+        run: node scripts/validate-commands.mjs

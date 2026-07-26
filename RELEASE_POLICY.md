@@ -4,6 +4,8 @@
 
 This document defines the release process, versioning policy, and package conventions for the WaffleFinance monorepo.
 
+For the per-package build target, artifact, and environment contract — including the relayer and Soroban contracts, which this document's versioning policy covers but whose build steps aren't detailed here — see [docs/RELEASE_CONTRACT.md](docs/RELEASE_CONTRACT.md).
+
 ## Versioning Policy
 
 ### Semantic Versioning (SemVer)

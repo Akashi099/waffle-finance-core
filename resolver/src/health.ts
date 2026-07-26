@@ -2,6 +2,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import type { ResolverConfig } from "./config.js";
 import type { Supervisor } from "./supervisor.js";
 import type { ResolverStatusMonitor } from "./registry-status.js";
+import { ResolverTelemetryCollector } from "./telemetry.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -16,6 +17,8 @@ export interface ResolverHealthDeps {
    * falls back to config-presence checks only.
    */
   registryStatus?: ResolverStatusMonitor;
+  /** Chains to report liveness for on GET /telemetry. Defaults to ["ethereum", "soroban"]. */
+  telemetryChains?: string[];
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -98,12 +101,15 @@ function readinessChecks(deps: ResolverHealthDeps) {
 /**
  * Create an HTTP server exposing three health endpoints:
  *
- * - `GET /healthz`  — liveness probe (always 200 while the process is alive).
- * - `GET /readyz`   — readiness probe (503 when a required dependency check fails).
- * - `GET /health`   — combined health payload with supervisor state and restart count.
+ * - `GET /healthz`   — liveness probe (always 200 while the process is alive).
+ * - `GET /readyz`    — readiness probe (503 when a required dependency check fails).
+ * - `GET /health`    — combined health payload with supervisor state and restart count.
+ * - `GET /telemetry` — resolver runtime telemetry (connected/degraded/stale/inactive).
  */
 export function createResolverHealthServer(deps: ResolverHealthDeps): Server {
   const startedAt = deps.startedAt ?? Date.now();
+  const telemetryChains = deps.telemetryChains ?? ["ethereum", "soroban"];
+  const telemetryCollector = new ResolverTelemetryCollector();
 
   return createServer((req, res) => {
     if (req.method !== "GET") {
@@ -173,6 +179,25 @@ export function createResolverHealthServer(deps: ResolverHealthDeps): Server {
         ...servicePayload(startedAt),
         checks,
       });
+      return;
+    }
+
+    // ── /telemetry — resolver runtime telemetry ──────────────────────────
+    // Reports whether the resolver is connected, degraded, stale, or
+    // inactive so operators can distinguish "delayed" from "not doing its
+    // job" without reading raw logs. See src/telemetry.ts.
+    if (req.url === "/telemetry") {
+      telemetryCollector
+        .collect({ supervisor: deps.supervisor, chains: telemetryChains })
+        .then((snapshot) => {
+          json(res, snapshot.state === "inactive" ? 503 : 200, {
+            ...snapshot,
+            ...servicePayload(startedAt),
+          });
+        })
+        .catch((err) => {
+          json(res, 500, { error: "telemetry_collection_failed", detail: String(err) });
+        });
       return;
     }
 

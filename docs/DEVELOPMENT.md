@@ -2,6 +2,8 @@
 
 This guide covers every path from a fresh checkout to a running local stack — via dev container (recommended) or a native host setup.
 
+For the canonical map of build, test, lint, and smoke-test commands per package — and which package each command actually validates — see [COMMANDS.md](./COMMANDS.md). That contract is enforced in CI by `pnpm validate:commands`.
+
 ---
 
 ## Table of contents

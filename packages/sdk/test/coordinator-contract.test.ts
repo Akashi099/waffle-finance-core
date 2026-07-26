@@ -28,6 +28,7 @@ import {
   CoordinatorValidationError,
 } from "../src/coordinator/index.js";
 import type { CoordinatorOrder } from "../src/coordinator/index.js";
+import { mixedChainHistoryPage, partialSrcLockedOrder } from "./fixtures/coordinator-responses.js";
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -145,13 +146,55 @@ describe("toOrder", () => {
 
   it("drops lockBlock (coordinator-internal)", () => {
     const order = toOrder(makeOrder());
-    expect((order.src as Record<string, unknown>)["lockBlock"]).toBeUndefined();
+    expect((order.src as unknown as Record<string, unknown>)["lockBlock"]).toBeUndefined();
   });
 
   it("converts an array with toOrders", () => {
     const orders = toOrders([makeOrder(), makeOrder({ status: "src_locked" })]);
     expect(orders).toHaveLength(2);
     expect(orders[1]?.status).toBe("src_locked");
+  });
+});
+
+// ── Transform: mixed-chain and partial-state history pages ───────────────────
+//
+// A wallet with activity across every coordinator-supported direction gets
+// one history page with orders in different lifecycle states. This exercises
+// toOrders end-to-end against that realistic shape instead of one order at a
+// time, using the fixtures shared with coordinator-client.test.ts and
+// subscription.test.ts so all three stay aligned with the same wire contract.
+
+describe("toOrders — mixed-chain history page", () => {
+  it("maps each order's direction and chain legs independently", () => {
+    const page = mixedChainHistoryPage();
+
+    const orders = toOrders(page.transactions);
+
+    expect(orders).toHaveLength(3);
+    expect(orders.map((o) => o.direction)).toEqual(["eth_to_xlm", "eth_to_sol", "sol_to_eth"]);
+    expect(orders.map((o) => o.status)).toEqual(["completed", "src_locked", "refunded"]);
+    expect(orders[0]!.src.chain).toBe("ethereum");
+    expect(orders[1]!.dst.chain).toBe("solana");
+    expect(orders[2]!.dst.orderId).toBeNull(); // refunded before dst leg was ever locked
+  });
+
+  it("preserves null preimage for orders that haven't revealed yet", () => {
+    const [completed, srcLocked, refunded] = toOrders(mixedChainHistoryPage().transactions);
+
+    expect(completed!.preimage).toBeNull(); // public consumers never see the raw preimage
+    expect(srcLocked!.preimage).toBeNull();
+    expect(refunded!.preimage).toBeNull();
+  });
+
+  it("round-trips a partially-locked order without losing null lock fields", () => {
+    const order = toOrder(partialSrcLockedOrder());
+
+    expect(order.status).toBe("src_locked");
+    expect(order.src.orderId).toBe("42");
+    expect(order.src.lockTx).toBe("0xaaaa");
+    expect(order.dst.orderId).toBeNull();
+    expect(order.dst.lockTx).toBeNull();
+    expect(order.dst.timelock).toBeNull();
   });
 });
 

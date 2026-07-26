@@ -81,6 +81,10 @@ export async function runCommand(): Promise<void> {
 
   const healthPort = Number(process.env.RESOLVER_HEALTH_PORT ?? 3003);
   const healthServer = startResolverHealthServer({ cfg, supervisor, registryStatus }, healthPort);
+  const healthServer = startResolverHealthServer(
+    { cfg, supervisor, telemetryChains: [CHAIN_ETH, CHAIN_SOROBAN] },
+    healthPort
+  );
   log.info({ port: healthPort }, "resolver health server listening");
 
   // ── 5. Signal handlers ───────────────────────────────────────────────────

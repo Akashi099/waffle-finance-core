@@ -544,7 +544,7 @@ describe("Cross-client interface parity", () => {
     const checks = [
       ethAdapter.createOrder({} as any),
       sorobanAdapter.createOrder({} as any, vi.fn()),
-      solanaAdapter.createOrder({} as any, { publicKey: {}, signTransaction: async (t: any) => t }),
+      solanaAdapter.createOrder({} as any, { publicKey: {}, signTransaction: async (t: any) => t } as any),
     ];
 
     for (const promise of checks) {

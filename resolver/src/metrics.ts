@@ -135,6 +135,15 @@ export const activeOperations = new Gauge({
   registers: [registry],
 });
 
+// ── Runtime telemetry ─────────────────────────────────────────────────────────
+
+export const resolverRuntimeStateInfo = new Gauge({
+  name: "resolver_runtime_state_info",
+  help: "Current resolver runtime telemetry state (1 = active state, 0 = otherwise). See src/telemetry.ts.",
+  labelNames: ["state"] as const,
+  registers: [registry],
+});
+
 export const resolverMetrics = {
   eventsTotal,
   listenerErrorsTotal,
@@ -153,4 +162,5 @@ export const resolverMetrics = {
   operationDurationSeconds,
   operationFailuresTotal,
   activeOperations,
+  resolverRuntimeStateInfo,
 } as const;
