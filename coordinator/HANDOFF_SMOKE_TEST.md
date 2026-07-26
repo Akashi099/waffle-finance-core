@@ -4,6 +4,11 @@
 validates the full cross-service order lifecycle through a single in-memory
 coordinator app. It runs in CI with no external services.
 
+This file covers the coordinator's own HTTP surface. For the repo-wide
+contract — readiness route, SDK-against-live-coordinator, and the frontend
+entry point — see [docs/SMOKE_TEST_CONTRACT.md](../docs/SMOKE_TEST_CONTRACT.md),
+which builds on this file rather than duplicating it.
+
 ## What it covers
 
 | Flow | Description |

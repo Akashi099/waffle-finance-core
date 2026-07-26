@@ -214,6 +214,7 @@ coordinator/ops/
 - **Test Examples**: `../test/`
 - **Configuration**: `../src/config.ts`
 - **Metrics Implementation**: `../src/metrics.ts`
+- **Deployment & rollback runbook**: [`docs/DEPLOYMENT_ROLLBACK_RUNBOOK.md`](../../docs/DEPLOYMENT_ROLLBACK_RUNBOOK.md) — rollback-first procedure for coordinator/relayer redeploys, tying restart verification to the metrics on this page
 
 ---
 
