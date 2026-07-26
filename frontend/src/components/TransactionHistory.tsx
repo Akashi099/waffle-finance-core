@@ -3,6 +3,7 @@ import { Clock, CheckCircle, XCircle, ArrowRight, ExternalLink, RefreshCw, Undo2
 import { isTestnet } from '../config/networks';
 import RefundDialog from '../features/refund/RefundDialog';
 import { useTransactionHistoryCache, type Transaction } from '../hooks/useTransactionHistoryCache';
+import { presentOrderStatus } from '../lib/orderStatusPresentation';
 import type { Address } from 'viem';
 
 interface TransactionHistoryProps {
@@ -43,57 +44,19 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
     apiBase: API_BASE_URL,
   });
 
-  const getStatusLabel = (status: Transaction['status']): string => {
-    switch (status) {
-      case 'confirmed':
-        return 'Confirmed';
-      case 'timed_out':
-        return 'Timed out';
-      case 'expired':
-        return 'Expired';
-      default:
-        return status.charAt(0).toUpperCase() + status.slice(1);
-    }
-  };
-
-  const getStatusColor = (status: Transaction['status']) => {
-    switch (status) {
-      case 'completed':
-      case 'confirmed':
-        return 'text-green-400 bg-green-500/20';
-      case 'pending':
-        return 'text-yellow-400 bg-yellow-500/20';
-      case 'cancelled':
-        return 'text-gray-400 bg-gray-500/20';
-      case 'failed':
-        return 'text-red-400 bg-red-500/20';
-      case 'refunded':
-        return 'text-emerald-400 bg-emerald-500/20';
-      case 'expired':
-      case 'timed_out':
-        return 'text-orange-400 bg-orange-500/20';
-      default:
-        return 'text-gray-400 bg-gray-500/20';
-    }
-  };
+  // Use the shared status presentation layer so all status rendering goes
+  // through a single mapping rather than ad hoc switch statements. The icon
+  // is the only piece that remains local because it requires JSX.
+  const getStatusPresentation = (status: Transaction['status']) =>
+    presentOrderStatus(status);
 
   const getStatusIcon = (status: Transaction['status']) => {
-    switch (status) {
-      case 'completed':
-      case 'confirmed':
-        return <CheckCircle className="h-4 w-4" />;
-      case 'pending':
-        return <Clock className="h-4 w-4" />;
-      case 'cancelled':
-      case 'failed':
-        return <XCircle className="h-4 w-4" />;
-      case 'refunded':
-        return <Undo2 className="h-4 w-4" />;
-      case 'expired':
-      case 'timed_out':
-        return <Clock className="h-4 w-4" />;
-      default:
-        return <Clock className="h-4 w-4" />;
+    const { iconName } = getStatusPresentation(status);
+    switch (iconName) {
+      case 'check-circle': return <CheckCircle className="h-4 w-4" />;
+      case 'x-circle':     return <XCircle className="h-4 w-4" />;
+      case 'undo':         return <Undo2 className="h-4 w-4" />;
+      default:             return <Clock className="h-4 w-4" />;
     }
   };
 
@@ -303,9 +266,9 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
             >
               <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex items-center gap-3">
-                  <div className={`flex items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${getStatusColor(tx.status)}`}>
+                  <div className={`flex items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${getStatusPresentation(tx.status).colorClass}`}>
                     {getStatusIcon(tx.status)}
-                    <span>{getStatusLabel(tx.status)}</span>
+                    <span>{getStatusPresentation(tx.status).label}</span>
                   </div>
                   <span className="text-xs text-slate-400">
                     {formatTime(tx.timestamp)}
