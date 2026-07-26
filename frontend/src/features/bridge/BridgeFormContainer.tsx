@@ -27,6 +27,24 @@ import {
   buildFallbackRecord,
   type OrderSubmissionFailure,
 } from '../../lib/orderSubmissionFallback';
+import { orderEventChannel, publishLocalOrderStatus } from '../../lib/orderEventStream';
+import { orderEventFromHistoryRow, type HistoryRowLike } from '../../lib/orderEvents';
+
+/**
+ * Publish a freshly written history row on the order-event contract.
+ *
+ * Routed through `orderEventFromHistoryRow` — the same adapter the coordinator
+ * poll path uses — so a row announced from here and the same row read back from
+ * `/api/orders/history` normalise identically. Best-effort: a failure to notify
+ * must never break the swap that triggered it.
+ */
+const publishOrderRow = (row: HistoryRowLike) => {
+  try {
+    orderEventChannel.publish(orderEventFromHistoryRow(row, 'local'));
+  } catch (err) {
+    console.warn('⚠️ Failed to publish order event:', err);
+  }
+};
 
 export interface BridgeFormProps {
   ethAddress: string;
@@ -151,7 +169,16 @@ const saveTransactionToHistory = (transaction: {
     
     // Save back to localStorage
     localStorage.setItem('wafflefinance_transactions_v2', JSON.stringify(transactions));
-    
+
+    // Announce on the subscription contract so a mounted TransactionHistory
+    // reflects this immediately instead of waiting out its poll interval.
+    // The localStorage write above stays authoritative — the event is a
+    // notification, not the record.
+    //
+    // Built with the same adapter the poll path uses, so the two sources cannot
+    // disagree about which leg a hash belongs to.
+    publishOrderRow(historyTransaction);
+
     console.log('💾 Transaction saved to history:', historyTransaction);
   } catch (error) {
     console.error('❌ Failed to save transaction to history:', error);
@@ -199,6 +226,18 @@ const saveFallbackToHistory = (record: import('../../lib/orderSubmissionFallback
     if (transactions.length > 50) transactions.splice(50);
     localStorage.setItem('wafflefinance_transactions_v2', JSON.stringify(transactions));
 
+    // Failure notification on the contract. Published with the classified
+    // error rather than letting the payload builder synthesise a generic one,
+    // so the UI can show why this attempt failed and whether retrying helps.
+    publishLocalOrderStatus(record.id, 'failed', {
+      error: {
+        code: 'order_failed',
+        message: record.errorMessage,
+        retryable: false,
+      },
+      details: { direction: record.direction, errorCode: record.errorCode },
+    });
+
     console.log('💾 Fallback record saved to history:', historyEntry);
   } catch (err) {
     console.error('❌ Failed to save fallback record to history:', err);
@@ -223,7 +262,12 @@ const updateTransactionStatus = (orderId: string, status: 'pending' | 'completed
         
         // Save back to localStorage
         localStorage.setItem('wafflefinance_transactions_v2', JSON.stringify(transactions));
-        
+
+        // Progression notification. Publishing the merged row (rather than just
+        // the status) means any tx hashes that arrived alongside the transition
+        // travel with it through the same direction-aware mapping.
+        publishOrderRow(transactions[transactionIndex]);
+
         console.log(`💾 Transaction status updated: ${orderId} -> ${status}`);
       } else {
         console.log(`⚠️ Transaction not found for status update: ${orderId}`);

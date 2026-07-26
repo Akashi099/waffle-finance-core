@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchWithRetry } from '../lib/fetchWithRetry';
+import {
+  createOrderEventChannel,
+  mergeTransports,
+  orderEventChannel,
+  type OrderEventChannel,
+} from '../lib/orderEventStream';
+import { orderEventFromHistoryRow, type OrderEvent } from '../lib/orderEvents';
+import { useOrderSubscription } from './useOrderSubscription';
 
 export interface Transaction {
   id: string;
@@ -41,6 +49,14 @@ interface UseTransactionHistoryCacheOptions {
   apiBase: string;
   staleMs?: number;
   fetcher?: typeof fetch;
+  /**
+   * Live event source to merge with the poll path. Defaults to the app-wide
+   * `orderEventChannel`, which is what the bridge form publishes into.
+   * Overridable so tests can drive the stream without touching global state.
+   *
+   * Captured on first render; later changes to this option are ignored.
+   */
+  liveChannel?: OrderEventChannel;
 }
 
 interface RefreshOptions {
@@ -136,12 +152,17 @@ export function useTransactionHistoryCache({
   apiBase,
   staleMs = DEFAULT_STALE_MS,
   fetcher = fetch,
+  liveChannel = orderEventChannel,
 }: UseTransactionHistoryCacheOptions) {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [lastFetchedAt, setLastFetchedAt] = useState<number | null>(null);
   const inFlightRef = useRef(false);
+  // Poll results are republished through the subscription contract rather than
+  // being consumed only here, so every path that wants order updates — this
+  // hook, the bridge form, anything added later — reads one event schema.
+  const pollChannel = useMemo(() => createOrderEventChannel(), []);
   const walletCacheKey = useMemo(
     () => getTransactionHistoryCacheKey(ethAddress, stellarAddress),
     [ethAddress, stellarAddress],
@@ -223,10 +244,19 @@ export function useTransactionHistoryCache({
         localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
         writeWalletCache(merged);
         setTransactions(merged);
+
+        // Announce the poll result on the contract. The subscription core
+        // diffs it against what the live channel has already reported, so a
+        // status the bridge form pushed seconds ago does not re-fire here.
+        pollChannel.publishAll(merged.map((tx) => orderEventFromHistoryRow(tx, 'poll')));
       } catch (err) {
         console.warn('Coordinator history unavailable, falling back to local cache:', err);
         setTransactions(cache?.transactions ?? loadFromStorage());
         setLastFetchedAt(cache?.fetchedAt ?? null);
+
+        // Surface the outage on the stream without disturbing `transactions`:
+        // the rows on screen are still the best information we have.
+        pollChannel.fail(err);
       } finally {
         inFlightRef.current = false;
         setIsLoading(false);
@@ -240,6 +270,7 @@ export function useTransactionHistoryCache({
       hasWalletAddress,
       isCacheStale,
       loadFromStorage,
+      pollChannel,
       readWalletCache,
       stellarAddress,
       transactions.length,
@@ -262,6 +293,76 @@ export function useTransactionHistoryCache({
     },
     [hasWalletAddress, writeWalletCache],
   );
+
+  /**
+   * Fold one contract event into the rendered rows.
+   *
+   * Only `status` events are acted on: the core has already suppressed no-op
+   * transitions, so anything arriving here is a genuine change. Snapshots are
+   * ignored because the poll path that produced them has already written the
+   * rows, and errors are ignored because a broken stream must not disturb the
+   * last known good state.
+   *
+   * Events for orders we have no row for are dropped rather than synthesised.
+   * An event carries a status, not a renderable transaction — the producer has
+   * already persisted the full row, and the next poll merges it in.
+   */
+  const applyOrderEvent = useCallback((event: OrderEvent) => {
+    if (event.type !== 'status') return;
+    const { order } = event;
+
+    setTransactions((previous) => {
+      const index = previous.findIndex((tx) => tx.id === order.orderId);
+      if (index === -1) return previous;
+
+      const current = previous[index];
+      const status = order.status as Transaction['status'];
+
+      // Undo the direction-aware src/dst mapping the payload builder applied.
+      const isEthSource = current.direction.startsWith('eth');
+      const ethTxHash = (isEthSource ? order.srcTxHash : order.dstTxHash) ?? current.ethTxHash;
+      const stellarTxHash =
+        (isEthSource ? order.dstTxHash : order.srcTxHash) ?? current.stellarTxHash;
+
+      if (
+        current.status === status &&
+        current.ethTxHash === ethTxHash &&
+        current.stellarTxHash === stellarTxHash
+      ) {
+        return previous;
+      }
+
+      const next = [...previous];
+      next[index] = { ...current, status, ethTxHash, stellarTxHash };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, []);
+
+  // The live channel is captured on first render rather than tracked as a
+  // dependency. Keying the transport on it means a caller who passes an inline
+  // `createOrderEventChannel()` gets a new transport every render, and the
+  // subscription effect then tears down and resubscribes in a loop. The channel
+  // is a long-lived singleton in every real usage, so pinning it costs nothing
+  // and removes a footgun that is very hard to diagnose from the symptom.
+  const liveChannelRef = useRef(liveChannel);
+  const orderEventTransport = useMemo(
+    () => mergeTransports(pollChannel.transport, liveChannelRef.current.transport),
+    [pollChannel],
+  );
+
+  const {
+    error: streamError,
+    consecutiveFailures: streamFailures,
+    phase: streamPhase,
+  } = useOrderSubscription({
+    transport: orderEventTransport,
+    onEvent: applyOrderEvent,
+    // Never give up. A history view outlives any single coordinator outage, and
+    // closing the subscription would also cut off the live bridge-form updates
+    // that share this transport.
+    maxConsecutiveFailures: 0,
+  });
 
   useEffect(() => {
     const cache = readWalletCache();
@@ -302,5 +403,13 @@ export function useTransactionHistoryCache({
     refreshFromCoordinator: () => refreshFromCoordinator({ force: true }),
     updateTransactions,
     loadFromStorage,
+    /**
+     * Health of the order-event subscription, distinct from the freshness of
+     * the rows. `isStale` says the data is old; `streamError` says we have
+     * temporarily lost the ability to learn that it is old.
+     */
+    streamError,
+    streamFailures,
+    streamPhase,
   };
 }
