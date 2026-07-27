@@ -1,6 +1,6 @@
 import type { Database } from "./db.js";
 import { canTransition, isTerminal } from "../state-machine/order-machine.js";
-import { dbQueryDuration } from "../metrics.js";
+import { dbQueryDuration, orderTransitionEventsTotal } from "../metrics.js";
 import { InMemoryRepositoryTransaction, type RepositoryTransaction } from "./transaction-contract.js";
 
 type DatabaseT = Database;
@@ -170,6 +170,7 @@ export class OrdersRepository {
   private readonly updateSecret: Statement;
   private readonly rollbackSrc: Statement;
   private readonly rollbackDst: Statement;
+  private readonly insertEvent: Statement;
 
   constructor(private readonly db: DatabaseT, transactionManager?: RepositoryTransaction) {
     this.transactionManager = transactionManager ?? new InMemoryRepositoryTransaction();
@@ -267,6 +268,10 @@ export class OrdersRepository {
         updated_at = CAST(strftime('%s','now') AS INTEGER)
       WHERE public_id = :publicId AND status = 'dst_locked'
     `);
+    this.insertEvent = db.prepare(`
+      INSERT INTO order_events (order_id, event_type, payload_json)
+      VALUES (:orderId, :eventType, :payloadJson)
+    `);
   }
 
   private async run(stmt: Statement, ...params: any[]): Promise<StatementResult> {
@@ -310,6 +315,27 @@ export class OrdersRepository {
       }
       return stmt.all(...params) as T[];
     });
+  }
+
+  /**
+   * Append a durable transition event to `order_events`.
+   *
+   * Every state mutation in this repository passes through this method so
+   * the full lifecycle of an order can be reconstructed from the event trail
+   * without reading the mutable `orders` row.  The metric counter lets
+   * operators monitor replay storms (sustained no-op rates) via Prometheus.
+   */
+  private async appendTransitionEvent(
+    orderId: number,
+    eventType: string,
+    payload: Record<string, unknown>
+  ): Promise<void> {
+    await this.run(this.insertEvent, {
+      orderId,
+      eventType,
+      payloadJson: JSON.stringify(payload),
+    });
+    orderTransitionEventsTotal.inc({ event_type: eventType });
   }
 
   /** Returns the public id of the new order. */
@@ -435,9 +461,19 @@ export class OrdersRepository {
     }
   }
 
-  async setStatus(publicId: string, status: OrderStatus): Promise<void> {
+  async setStatus(publicId: string, status: OrderStatus, actor = "system"): Promise<void> {
     await this.transactionManager.runWithRetry("status-update", async () => {
+      const order = await this.get<OrderDbRow>(this.byPublicId, publicId);
       await this.run(this.updateStatus, { publicId, status });
+      if (order) {
+        await this.appendTransitionEvent(order.id, "status.transitioned", {
+          actor,
+          fromStatus: order.status,
+          toStatus: status,
+          outcome: "transitioned",
+          triggeredAt: Math.floor(Date.now() / 1000),
+        });
+      }
     });
   }
 
@@ -460,17 +496,44 @@ export class OrdersRepository {
     txHash: string;
     blockNumber: number;
     timelock: number;
+    actor?: string;
   }): Promise<void> {
     await this.transactionManager.runWithRetry("src-lock-update", async () => {
       const order = await this.get<OrderDbRow>(this.byPublicId, input.publicId);
       if (!order) return;
-      // Repeated lock events on a terminal order are a no-op: a completed,
-      // refunded or failed order must never be dragged back into src_locked
-      // under event replay. (`expired` is non-terminal: it falls through to
-      // nextLockStatus, which keeps it expired since the transition is invalid.)
-      if (isTerminal(order.status)) return;
+      const actor = input.actor ?? "system";
+      const now = Math.floor(Date.now() / 1000);
+      if (isTerminal(order.status)) {
+        await this.appendTransitionEvent(order.id, "src_lock.no_op", {
+          actor,
+          fromStatus: order.status,
+          toStatus: order.status,
+          outcome: "no_op:terminal",
+          txHash: input.txHash,
+          blockNumber: input.blockNumber,
+          triggeredAt: now,
+        });
+        return;
+      }
       const status = this.nextLockStatus(order.status, "src_locked");
-      await this.run(this.updateSrcLock, { ...input, status });
+      await this.run(this.updateSrcLock, {
+        publicId: input.publicId,
+        orderId: input.orderId,
+        txHash: input.txHash,
+        blockNumber: input.blockNumber,
+        timelock: input.timelock,
+        status,
+      });
+      const outcome = status === order.status ? "no_op:already_at_target" : "transitioned";
+      await this.appendTransitionEvent(order.id, status === order.status ? "src_lock.no_op" : "src_lock.transitioned", {
+        actor,
+        fromStatus: order.status,
+        toStatus: status,
+        outcome,
+        txHash: input.txHash,
+        blockNumber: input.blockNumber,
+        triggeredAt: now,
+      });
     });
   }
 
@@ -481,17 +544,45 @@ export class OrdersRepository {
     blockNumber: number;
     timelock: number;
     resolver: string | null;
+    actor?: string;
   }): Promise<void> {
     await this.transactionManager.runWithRetry("dst-lock-update", async () => {
       const order = await this.get<OrderDbRow>(this.byPublicId, input.publicId);
       if (!order) return;
-      // Idempotent no-op for terminal orders: a repeated recordDstLock must
-      // not move a completed/refunded/failed order into dst_locked. (`expired`
-      // is non-terminal but still can't transition to dst_locked, so
-      // nextLockStatus keeps it expired.)
-      if (isTerminal(order.status)) return;
+      const actor = input.actor ?? "system";
+      const now = Math.floor(Date.now() / 1000);
+      if (isTerminal(order.status)) {
+        await this.appendTransitionEvent(order.id, "dst_lock.no_op", {
+          actor,
+          fromStatus: order.status,
+          toStatus: order.status,
+          outcome: "no_op:terminal",
+          txHash: input.txHash,
+          blockNumber: input.blockNumber,
+          triggeredAt: now,
+        });
+        return;
+      }
       const status = this.nextLockStatus(order.status, "dst_locked");
-      await this.run(this.updateDstLock, { ...input, status });
+      await this.run(this.updateDstLock, {
+        publicId: input.publicId,
+        orderId: input.orderId,
+        txHash: input.txHash,
+        blockNumber: input.blockNumber,
+        timelock: input.timelock,
+        resolver: input.resolver,
+        status,
+      });
+      const outcome = status === order.status ? "no_op:already_at_target" : "transitioned";
+      await this.appendTransitionEvent(order.id, status === order.status ? "dst_lock.no_op" : "dst_lock.transitioned", {
+        actor,
+        fromStatus: order.status,
+        toStatus: status,
+        outcome,
+        txHash: input.txHash,
+        blockNumber: input.blockNumber,
+        triggeredAt: now,
+      });
     });
   }
 
@@ -500,15 +591,84 @@ export class OrdersRepository {
     preimage: string;
     txHash: string;
     encVersion?: number | null;
+    actor?: string;
   }): Promise<void> {
     await this.transactionManager.runWithRetry("secret-update", async () => {
+      const order = await this.get<OrderDbRow>(this.byPublicId, input.publicId);
+      if (!order) return;
+      const actor = input.actor ?? "system";
+      const now = Math.floor(Date.now() / 1000);
+      if (isTerminal(order.status)) {
+        await this.appendTransitionEvent(order.id, "secret_revealed.no_op", {
+          actor,
+          fromStatus: order.status,
+          toStatus: order.status,
+          outcome: "no_op:terminal",
+          txHash: input.txHash,
+          triggeredAt: now,
+        });
+        return;
+      }
+      // Idempotent: same preimage already recorded — avoid overwriting the tx hash
+      // with a replay from a different block while the observable state is identical.
+      if (order.preimage !== null && order.preimage === input.preimage) {
+        await this.appendTransitionEvent(order.id, "secret_revealed.no_op", {
+          actor,
+          fromStatus: order.status,
+          toStatus: order.status,
+          outcome: "no_op:idempotent",
+          txHash: input.txHash,
+          triggeredAt: now,
+        });
+        return;
+      }
       await this.run(this.updateSecret, {
         publicId: input.publicId,
         preimage: input.preimage,
         txHash: input.txHash,
-        encVersion: input.encVersion ?? null
+        encVersion: input.encVersion ?? null,
+      });
+      await this.appendTransitionEvent(order.id, "secret_revealed.transitioned", {
+        actor,
+        fromStatus: order.status,
+        toStatus: "secret_revealed",
+        outcome: "transitioned",
+        txHash: input.txHash,
+        triggeredAt: now,
       });
     });
+  }
+
+  /**
+   * Return all transition events recorded for an order in insertion order.
+   *
+   * Each event carries the `eventType` (e.g. `src_lock.transitioned`), the
+   * structured payload (actor, fromStatus, toStatus, outcome, …), and a unix
+   * timestamp.  Callers can use this to reconstruct the full lifecycle without
+   * reading the mutable `orders` row.
+   */
+  async findTransitionEvents(publicId: string): Promise<
+    { eventType: string; payload: Record<string, unknown>; createdAt: number }[]
+  > {
+    const rows = await this.all<{
+      event_type: string;
+      payload_json: string;
+      created_at: number;
+    }>(
+      this.db.prepare(`
+        SELECT oe.event_type, oe.payload_json, oe.created_at
+        FROM order_events oe
+        JOIN orders o ON o.id = oe.order_id
+        WHERE o.public_id = ?
+        ORDER BY oe.id ASC
+      `),
+      publicId
+    );
+    return rows.map((r) => ({
+      eventType: r.event_type,
+      payload: JSON.parse(r.payload_json) as Record<string, unknown>,
+      createdAt: r.created_at,
+    }));
   }
 
   async rollbackSrcLock(publicId: string): Promise<void> {

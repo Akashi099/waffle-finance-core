@@ -405,45 +405,20 @@ export const RELAYER_CONFIG = {
   }
 };
 
+import { validateRelayerStartup, formatStartupErrors } from './config-validator.js';
+
 // Validate required environment variables
 function validateConfig() {
-  const requiredVars = [
-    'ETHEREUM_RPC_URL',
-    'STELLAR_HORIZON_URL',
-  ];
+  const errors = validateRelayerStartup(process.env as Record<string, string | undefined>, {
+    ethereumPrivateKey: RELAYER_CONFIG.ethereum.privateKey,
+    stellarSecretKey: RELAYER_CONFIG.stellar.secretKey,
+  });
 
-  const missingVars = requiredVars.filter(
-    varName => !process.env[varName] || process.env[varName]?.includes('YOUR_')
-  );
-
-  if (missingVars.length > 0) {
-    const list = missingVars.join(', ');
+  if (errors.length > 0) {
     throw new Error(
-      `Missing or placeholder environment variables: ${list}. ` +
-      'Copy env.template to .env and configure all required values before starting.'
-    );
-  }
-
-  // Hard-fail on placeholder private keys
-  const ethKey = RELAYER_CONFIG.ethereum.privateKey;
-  if (!ethKey) {
-    throw new Error('RELAYER_PRIVATE_KEY is not set. Set it in .env before starting.');
-  }
-  if (ethKey.startsWith('0x000000') || ethKey === '0x0000000000000000000000000000000000000000000000000000000000000001') {
-    throw new Error(
-      'RELAYER_PRIVATE_KEY looks like a placeholder (all-zero / dummy key). ' +
-      'Generate a real key: node -e "console.log(require(\'ethers\').Wallet.createRandom().privateKey)"'
-    );
-  }
-
-  const stellarSecret = RELAYER_CONFIG.stellar.secretKey;
-  if (!stellarSecret) {
-    throw new Error('RELAYER_STELLAR_SECRET is not set. Set it in .env before starting.');
-  }
-  if (stellarSecret.includes('SAMPLE') || stellarSecret.includes('YOUR_')) {
-    throw new Error(
-      'RELAYER_STELLAR_SECRET looks like a placeholder. ' +
-      'Generate a real key: stellar keys generate'
+      `Relayer startup validation failed — ${errors.length} misconfiguration(s) found:\n` +
+      formatStartupErrors(errors) + '\n' +
+      'Fix all of the above before starting the relayer.'
     );
   }
 }

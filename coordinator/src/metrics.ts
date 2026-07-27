@@ -456,3 +456,38 @@ export const maintenanceMetrics = {
   lastRun: maintenanceLastRun,
   skippedTotal: maintenanceSkippedTotal,
 } as const;
+
+// ── Event-state transition metrics ────────────────────────────────────────────
+
+/**
+ * Total transition events appended to the order_events durable audit trail.
+ *
+ * `event_type` corresponds to the values written by OrdersRepository, e.g.
+ * `src_lock.transitioned`, `src_lock.no_op`, `secret_revealed.transitioned`.
+ * A sustained no_op rate for a given event_type signals replay storms or a
+ * misconfigured listener delivering stale events.
+ */
+export const orderTransitionEventsTotal = new Counter({
+  name: "coordinator_order_transition_events_total",
+  help: "Total transition events appended to the order_events table, by event_type",
+  labelNames: ["event_type"] as const,
+  registers: [registry],
+});
+
+// ── Secret recovery metrics ───────────────────────────────────────────────────
+
+/**
+ * Total secret recovery attempts, classified by outcome.
+ *
+ * `outcome` values: `recovered`, `already_known`, `invalid_preimage`,
+ * `state_conflict`, `error`.
+ *
+ * Use this to track the health of the recovery engine over time and alert
+ * when `invalid_preimage` or `error` rates rise unexpectedly.
+ */
+export const secretRecoveryOutcomeTotal = new Counter({
+  name: "coordinator_secret_recovery_outcome_total",
+  help: "Total secret recovery attempts classified by outcome",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
