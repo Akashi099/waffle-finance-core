@@ -60,6 +60,8 @@ async function createPostgresDb() {
       DROP TABLE IF EXISTS order_events CASCADE;
       DROP TABLE IF EXISTS orders CASCADE;
       DROP TABLE IF EXISTS resolver_heartbeats CASCADE;
+      DROP TABLE IF EXISTS audit_log CASCADE;
+      DROP TABLE IF EXISTS schema_migrations CASCADE;
     `);
     return db;
   } catch (error) {
@@ -127,7 +129,7 @@ describe("PostgreSQL Database Compatibility", () => {
     const migrations = await queryMigrations(db);
     expect(migrations.length).toBeGreaterThan(0);
     const version = await getCurrentSchemaVersion(db);
-    const expected = dbType === "postgres" ? "006_stale_cleanup_postgres.sql" : "006_stale_cleanup.sql";
+    const expected = dbType === "postgres" ? "007_audit_log_postgres.sql" : "007_audit_log.sql";
     expect(version).toBe(expected);
   });
 
@@ -551,8 +553,10 @@ describe("PostgreSQL Migration Edge Cases", () => {
       "002_solana_support_postgres.sql",
       "003_secret_encryption.sql",
       "004_query_optimizations.sql",
+      "005_cursor_pagination.sql",
       "005_schema_migrations.sql",
       "006_stale_cleanup_postgres.sql",
+      "007_audit_log_postgres.sql",
     ]);
 
     await fresh.getPool().end();
@@ -606,7 +610,7 @@ describe("PostgreSQL Migration Edge Cases", () => {
     if (!fresh) return;
 
     const version = await getCurrentSchemaVersion(fresh);
-    expect(version).toBe("006_stale_cleanup_postgres.sql");
+    expect(version).toBe("007_audit_log_postgres.sql");
 
     await fresh.getPool().end();
   });

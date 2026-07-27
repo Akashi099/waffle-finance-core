@@ -73,7 +73,7 @@ function readinessChecks(deps: ResolverHealthDeps, policy: SupportPolicy) {
     supervisorState === "stopping" ||
     supervisorState === "stopped";
 
-  return [
+  const checks = [
     {
       name: "ethereum_config",
       ok: ethClaim.supported,
@@ -92,6 +92,21 @@ function readinessChecks(deps: ResolverHealthDeps, policy: SupportPolicy) {
       detail: supervisorState,
     },
   ];
+
+  // Registry status: not-ready when this resolver's own on-chain standing on
+  // any tracked chain is low_stake / slashed / unbonding / inactive. A chain
+  // that has never been probed (registry not configured for it) reports
+  // ok=true — see ResolverStatusMonitor.isReady().
+  if (registryStatus) {
+    const ready = registryStatus.isReady();
+    checks.push({
+      name: "registry_status",
+      ok: ready,
+      detail: ready ? "active" : "degraded",
+    });
+  }
+
+  return checks;
 }
 
 // ── Server factory ────────────────────────────────────────────────────────────

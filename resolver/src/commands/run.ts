@@ -14,6 +14,7 @@ import { Supervisor, FatalError } from "../supervisor.js";
 import { startResolverHealthServer } from "../health.js";
 import { buildSupportPolicy, chainLabel, logSupportPolicy } from "../support.js";
 import { metricsRouter } from "../routes/metrics.js";
+import { ResolverStatusMonitor, DEFAULT_STATUS_POLL_INTERVAL_MS } from "../registry-status.js";
 import {
   startTimeSeconds,
   ordersProcessedTotal,
@@ -108,6 +109,7 @@ export async function runCommand(): Promise<void> {
   );
 
   const healthPort = Number(process.env.RESOLVER_HEALTH_PORT ?? 3003);
+  const healthServer = startResolverHealthServer({ cfg, supervisor, registryStatus }, healthPort);
   const healthServer = startResolverHealthServer(
     { cfg, supervisor, policy, telemetryChains: observedChains.map(chainLabel) },
     healthPort
@@ -152,6 +154,7 @@ export async function runCommand(): Promise<void> {
 
     // Tell the supervisor to stop and cancel any pending restart sleep.
     supervisor.stop();
+    registryStatus.stop();
 
     // Stop listeners concurrently.  Each stop is independently try-caught so
     // one failure doesn't prevent the other from being cleaned up.

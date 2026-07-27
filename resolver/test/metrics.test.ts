@@ -15,6 +15,7 @@ describe("resolver metrics", () => {
     expect(metrics).toContain("resolver_listener_last_event_timestamp_seconds");
     expect(metrics).toContain("resolver_active_listeners");
     expect(metrics).toContain("resolver_registration_info");
+    expect(metrics).toContain("resolver_registry_lifecycle_state");
     expect(metrics).toContain("resolver_registration_changes_total");
     expect(metrics).toContain("resolver_start_time_seconds");
     expect(metrics).toContain("resolver_orders_processed_total");
@@ -99,6 +100,7 @@ describe("resolver metrics", () => {
     expect(resolverMetrics.listenerLastEventTimestampSeconds).toBeDefined();
     expect(resolverMetrics.activeListeners).toBeDefined();
     expect(resolverMetrics.registrationInfo).toBeDefined();
+    expect(resolverMetrics.resolverLifecycleState).toBeDefined();
     expect(resolverMetrics.registrationChangesTotal).toBeDefined();
     expect(resolverMetrics.startTimeSeconds).toBeDefined();
     expect(resolverMetrics.ordersProcessedTotal).toBeDefined();
