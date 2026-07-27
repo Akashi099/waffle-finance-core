@@ -1,6 +1,12 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
+import {
+  describeSupportPolicy,
+  supportsAction,
+  type SupportPolicy,
+} from "@wafflefinance/config";
 import type { ResolverConfig } from "./config.js";
 import type { Supervisor } from "./supervisor.js";
+import { buildSupportPolicy } from "./support.js";
 import { ResolverTelemetryCollector } from "./telemetry.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -9,6 +15,12 @@ export interface ResolverHealthDeps {
   cfg: ResolverConfig;
   supervisor: Supervisor;
   startedAt?: number;
+  /**
+   * The runtime's declared capabilities.  Defaults to the policy derived from
+   * `cfg`, so callers that do not thread one through still get policy-backed
+   * readiness rather than ad-hoc config sniffing.
+   */
+  policy?: SupportPolicy;
   /** Chains to report liveness for on GET /telemetry. Defaults to ["ethereum", "soroban"]. */
   telemetryChains?: string[];
 }
@@ -32,14 +44,21 @@ function servicePayload(startedAt: number) {
 /**
  * Build the per-dependency readiness checks.
  *
- * These are lightweight config-presence checks (no live RPC calls) so they
- * complete in microseconds and never block a health probe.
+ * These are lightweight capability checks against the support policy (no live
+ * RPC calls) so they complete in microseconds and never block a health probe.
+ *
+ * A chain is "ready" when the resolver can `claim` on it — the action that makes
+ * a resolver useful.  This is the same underlying condition the previous
+ * hand-rolled checks tested (HTLC address plus signing key), but the reported
+ * detail now names the actual defect: the old code reported
+ * `missing_htlc_escrow` even when the escrow was present and the *key* was the
+ * missing piece.
  */
-function readinessChecks(deps: ResolverHealthDeps) {
-  const { cfg, supervisor } = deps;
+function readinessChecks(deps: ResolverHealthDeps, policy: SupportPolicy) {
+  const { supervisor } = deps;
 
-  const ethOk = Boolean(cfg.ethereum.htlcEscrow && cfg.ethereum.resolverPrivateKey);
-  const sorobanOk = Boolean(cfg.soroban.htlc && cfg.soroban.resolverSecret);
+  const ethClaim = supportsAction(policy, "ethereum", "claim");
+  const sorobanClaim = supportsAction(policy, "stellar", "claim");
 
   // "supervisor" check: ok when it is actively running or idle (not yet
   // started).  Not-ok when it has stopped due to exhausted restarts or a fatal
@@ -57,13 +76,15 @@ function readinessChecks(deps: ResolverHealthDeps) {
   return [
     {
       name: "ethereum_config",
-      ok: ethOk,
-      detail: ethOk ? "configured" : "missing_htlc_escrow",
+      ok: ethClaim.supported,
+      detail: ethClaim.supported ? "configured" : ethClaim.reason,
+      level: policy.chains.ethereum.level,
     },
     {
       name: "soroban_config",
-      ok: sorobanOk,
-      detail: sorobanOk ? "configured" : "missing_htlc_contract",
+      ok: sorobanClaim.supported,
+      detail: sorobanClaim.supported ? "configured" : sorobanClaim.reason,
+      level: policy.chains.stellar.level,
     },
     {
       name: "supervisor",
@@ -82,11 +103,14 @@ function readinessChecks(deps: ResolverHealthDeps) {
  * - `GET /readyz`    — readiness probe (503 when a required dependency check fails).
  * - `GET /health`    — combined health payload with supervisor state and restart count.
  * - `GET /telemetry` — resolver runtime telemetry (connected/degraded/stale/inactive).
+ * - `GET /support`   — the runtime's declared support policy (chains, actions,
+ *                      routes, and the routes it will refuse).
  */
 export function createResolverHealthServer(deps: ResolverHealthDeps): Server {
   const startedAt = deps.startedAt ?? Date.now();
   const telemetryChains = deps.telemetryChains ?? ["ethereum", "soroban"];
   const telemetryCollector = new ResolverTelemetryCollector();
+  const policy = deps.policy ?? buildSupportPolicy(deps.cfg);
 
   return createServer((req, res) => {
     if (req.method !== "GET") {
@@ -113,7 +137,7 @@ export function createResolverHealthServer(deps: ResolverHealthDeps): Server {
     // A supervisor in "stopping" state returns 503 so new traffic is not
     // routed to a pod that is mid-teardown.
     if (req.url === "/readyz") {
-      const checks = readinessChecks(deps);
+      const checks = readinessChecks(deps, policy);
       const state = deps.supervisor.state;
 
       // Pods that are cleanly stopping should not receive new traffic.
@@ -136,7 +160,7 @@ export function createResolverHealthServer(deps: ResolverHealthDeps): Server {
     // Full health payload for dashboards and debugging.  Not used by
     // Kubernetes probes directly (too verbose for high-frequency polling).
     if (req.url === "/health") {
-      const checks = readinessChecks(deps);
+      const checks = readinessChecks(deps, policy);
       const state = deps.supervisor.state;
       const dependencyFailures = checks.filter((c) => !c.ok);
 
@@ -175,6 +199,20 @@ export function createResolverHealthServer(deps: ResolverHealthDeps): Server {
         .catch((err) => {
           json(res, 500, { error: "telemetry_collection_failed", detail: String(err) });
         });
+      return;
+    }
+
+    // ── /support — declared capabilities ─────────────────────────────────
+    // Makes the support policy observable: which chains and actions this
+    // process can use, which routes it will carry, and which chain pairs it
+    // will refuse (with the reason).  Returns 503 when the runtime cannot
+    // carry any route, so "started but useless" is externally visible.
+    if (req.url === "/support") {
+      const summary = describeSupportPolicy(policy);
+      json(res, summary.actionable ? 200 : 503, {
+        ...summary,
+        ...servicePayload(startedAt),
+      });
       return;
     }
 
