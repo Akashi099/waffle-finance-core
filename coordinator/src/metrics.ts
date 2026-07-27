@@ -368,3 +368,76 @@ export const solanaPlaceholderMode = new Gauge({
   help: "1 when SOLANA_HTLC_PROGRAM is a placeholder and Solana flows are disabled, 0 when configured",
   registers: [registry],
 });
+
+// ── Maintenance scheduler metrics ─────────────────────────────────────────────
+
+/**
+ * Total maintenance job executions by job name and result.
+ *
+ * `job` label values correspond to the names registered with
+ * `MaintenanceScheduler.register()` — e.g. `expiry_scan`, `stale_cleanup`,
+ * `archival_policy`.
+ *
+ * `result` is `success` or `failure`.
+ *
+ * Use this to alert when a job's failure rate rises above a threshold, or
+ * when a job stops running altogether (counter stops incrementing).
+ */
+export const maintenanceRunsTotal = new Counter({
+  name: "coordinator_maintenance_runs_total",
+  help: "Total maintenance job executions by job name and result",
+  labelNames: ["job", "result"] as const,
+  registers: [registry],
+});
+
+/**
+ * Wall-clock seconds each maintenance job took per execution.
+ *
+ * Useful for spotting regressions where a cleanup job is suddenly taking
+ * much longer than normal — often a sign of table-scan performance
+ * degradation as the orders table grows.
+ */
+export const maintenanceJobDuration = new Histogram({
+  name: "coordinator_maintenance_job_duration_seconds",
+  help: "Wall-clock seconds each maintenance job execution took",
+  labelNames: ["job"] as const,
+  buckets: [0.005, 0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30],
+  registers: [registry],
+});
+
+/**
+ * Unix timestamp (seconds) of the last successful completion of each
+ * maintenance job.
+ *
+ * Alert rule: `time() - coordinator_maintenance_last_run_timestamp_seconds{job="expiry_scan"} > 2 * cadence`
+ * fires when the job has not run within twice its configured cadence.
+ */
+export const maintenanceLastRun = new Gauge({
+  name: "coordinator_maintenance_last_run_timestamp_seconds",
+  help: "Unix timestamp of the last successful maintenance job run, by job name",
+  labelNames: ["job"] as const,
+  registers: [registry],
+});
+
+/**
+ * Total maintenance job invocations that were skipped because the previous
+ * run of the same job was still in flight at tick time.
+ *
+ * A non-zero rate is normal under transient load spikes.  A sustained high
+ * rate means the job's cadence is shorter than its execution time — the
+ * cadence multiplier should be increased or the job should be made faster.
+ */
+export const maintenanceSkippedTotal = new Counter({
+  name: "coordinator_maintenance_skipped_total",
+  help: "Maintenance job tick invocations skipped because the previous run was still in flight",
+  labelNames: ["job"] as const,
+  registers: [registry],
+});
+
+/** All maintenance scheduler metrics in one object — useful for test assertions. */
+export const maintenanceMetrics = {
+  runsTotal: maintenanceRunsTotal,
+  jobDuration: maintenanceJobDuration,
+  lastRun: maintenanceLastRun,
+  skippedTotal: maintenanceSkippedTotal,
+} as const;

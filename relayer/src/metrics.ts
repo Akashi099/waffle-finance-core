@@ -268,3 +268,192 @@ export const settlementMetrics = {
   verificationTotal: settlementVerificationTotal,
   proofReplaysTotal: settlementProofReplaysTotal,
 } as const;
+
+// ---------------------------------------------------------------------------
+// Pipeline observability — order ingestion, relay decision, submission,
+// receipt, retries, queue depth, dropped orders, chain delay.
+//
+// These metrics give operators a complete picture of where in the pipeline
+// an order is, how long each stage takes, and where pressure or failures
+// accumulate.  Naming follows the existing convention:
+//   relayer_<subsystem>_<name>_<unit>
+//
+// Label cardinality is kept low: `direction` (eth_to_xlm | xlm_to_eth),
+// `chain` (ethereum | stellar), `result` (success | failure | ...).
+// No order-level data (addresses, amounts, hashlocks) ever appears in labels.
+// ---------------------------------------------------------------------------
+
+/**
+ * Total orders received at the ingestion boundary (POST /api/orders/create).
+ *
+ * Incremented immediately on every request that passes basic HTTP parsing,
+ * before route-capability or permission checks.  Compare with
+ * `relayer_relay_decision_total{result="accepted"}` to compute the
+ * rejection rate at the policy boundary.
+ *
+ * `direction` label: the direction slug from the request body, or
+ * "unknown" when the body is missing or malformed.
+ */
+export const orderIngestionTotal = new Counter({
+  name: 'relayer_order_ingestion_total',
+  help: 'Total orders received at the relayer ingestion boundary, by direction',
+  labelNames: ['direction'] as const,
+  registers: [registry],
+});
+
+/**
+ * Current number of orders tracked in the relayer's active-order map.
+ *
+ * Sampled after every successful ingestion and after every terminal
+ * state transition (settled, refunded, expired).  A steadily climbing
+ * gauge with no corresponding decrease in settlement metrics indicates
+ * orders are being accepted but not settling.
+ */
+export const orderQueueDepth = new Gauge({
+  name: 'relayer_order_queue_depth',
+  help: 'Current number of orders in the relayer active-order map',
+  registers: [registry],
+});
+
+/**
+ * Total relay-policy decisions, by direction and result.
+ *
+ * `result` label values:
+ *   accepted              — route + permissions passed; order entered pipeline
+ *   rejected_route        — decideOrderRoute returned supported=false
+ *   rejected_permissions  — checkOrderSettleable returned a denial
+ *   rejected_validation   — request body failed schema validation
+ *
+ * Use `rate(relayer_relay_decision_total{result!="accepted"}[5m])` to alert
+ * on a sustained spike in policy rejections (could indicate a misconfiguration
+ * or a client bug sending bad directions).
+ */
+export const relayDecisionTotal = new Counter({
+  name: 'relayer_relay_decision_total',
+  help: 'Total relay-policy decisions at order creation, by direction and result',
+  labelNames: ['direction', 'result'] as const,
+  registers: [registry],
+});
+
+/**
+ * End-to-end submission latency: from the moment the relayer accepts an order
+ * (route + permissions passed) to the moment the on-chain transaction hash
+ * is confirmed or an error is returned.
+ *
+ * Measured in seconds.  Use p95/p99 to set SLO thresholds; a histogram
+ * is more useful than a summary here because the distribution is bimodal
+ * (fast testnet paths vs slow mainnet gas estimation + confirm loops).
+ *
+ * `direction` label identifies which bridge leg was submitted.
+ * `result` is `success` or `failure`.
+ */
+export const submissionLatencySeconds = new Histogram({
+  name: 'relayer_submission_latency_seconds',
+  help: 'Latency from order acceptance to on-chain tx hash, in seconds',
+  labelNames: ['direction', 'result'] as const,
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 30, 60, 120],
+  registers: [registry],
+});
+
+/**
+ * Receipt / proof-verification latency: from the moment the relayer
+ * receives a settlement proof request (POST /api/orders/xlm-to-eth or
+ * the xlm-proof branch of /api/orders/process) to the moment Horizon
+ * verification completes (success or failure).
+ *
+ * This isolates the Horizon round-trip from the subsequent ETH release,
+ * making it easy to spot when Horizon is slow without blaming the Ethereum
+ * RPC.
+ *
+ * `result` values: `success`, `tx_not_found`, `tx_failed`,
+ *   `payment_mismatch`, `horizon_error`.
+ */
+export const receiptLatencySeconds = new Histogram({
+  name: 'relayer_receipt_latency_seconds',
+  help: 'Latency for Horizon proof verification on the XLM→ETH path, in seconds',
+  labelNames: ['result'] as const,
+  buckets: [0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 30],
+  registers: [registry],
+});
+
+/**
+ * Distribution of retry attempts per submission or Horizon call.
+ *
+ * One observation per *completed* submission attempt (whether it eventually
+ * succeeded or exhausted retries).  The value is the number of retries
+ * performed (0 = succeeded on first try, N = needed N extra attempts).
+ *
+ * `operation` label: `eth_send` | `balance_check` | `horizon_verify`.
+ * `result`: `success` | `failure` (did the final attempt succeed?).
+ *
+ * A high p95 retry count for `eth_send` suggests RPC rate-limiting or
+ * network instability; a high count for `horizon_verify` suggests Horizon
+ * node issues.
+ */
+export const retryAttemptsHistogram = new Histogram({
+  name: 'relayer_retry_attempts',
+  help: 'Distribution of retry count per submission or verification attempt',
+  labelNames: ['operation', 'result'] as const,
+  buckets: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  registers: [registry],
+});
+
+/**
+ * Total orders dropped from the active-order map without reaching a
+ * terminal settlement state.
+ *
+ * An order is "dropped" when the relayer cannot proceed and has no safe
+ * retry path — e.g. a permanent Horizon error on the XLM→ETH path after
+ * the proof was already consumed, or a fatal ETH transaction failure.
+ *
+ * `reason` label: a short stable code (not a raw error message):
+ *   eth_tx_failed       — Ethereum send reverted or timed out fatally
+ *   horizon_permanent   — Horizon returned a terminal error (tx_failed, etc.)
+ *   proof_replay        — stellarTxHash already consumed
+ *   permission_denied   — settlement permission check failed mid-flight
+ *   internal_error      — unexpected exception with no safe retry
+ */
+export const droppedOrdersTotal = new Counter({
+  name: 'relayer_dropped_orders_total',
+  help: 'Total orders dropped without reaching a terminal settlement state, by reason',
+  labelNames: ['direction', 'reason'] as const,
+  registers: [registry],
+});
+
+/**
+ * Observed delay between the expected and actual processing time for a
+ * chain event or settlement step, per chain.
+ *
+ * Set to a non-negative number of seconds after each settlement step
+ * completes.  The value represents how far behind "real time" that step
+ * was — for example, if the relayer expected to confirm an ETH tx within
+ * 30 s but it took 90 s, the gauge is set to 60.
+ *
+ * Reset to 0 when the step completes on time.  A persistently elevated
+ * gauge for a specific chain indicates congestion or RPC node issues on
+ * that chain.
+ *
+ * `chain` label: `ethereum` | `stellar`.
+ */
+export const chainDelayGauge = new Gauge({
+  name: 'relayer_chain_delay_seconds',
+  help: 'Observed delay beyond expected processing time for the most recent step, per chain',
+  labelNames: ['chain'] as const,
+  registers: [registry],
+});
+
+// ---------------------------------------------------------------------------
+// Convenience re-export
+// ---------------------------------------------------------------------------
+
+/** All pipeline observability metrics in one object — useful for test assertions. */
+export const pipelineMetrics = {
+  ingestionTotal: orderIngestionTotal,
+  queueDepth: orderQueueDepth,
+  relayDecisionTotal,
+  submissionLatency: submissionLatencySeconds,
+  receiptLatency: receiptLatencySeconds,
+  retryAttempts: retryAttemptsHistogram,
+  droppedOrders: droppedOrdersTotal,
+  chainDelay: chainDelayGauge,
+} as const;
