@@ -1,7 +1,5 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, lazy, Suspense } from 'react'
 import BridgeForm from './components/BridgeForm'
-import DarkVeil from './components/DarkVeil'
-import TransactionHistory from './components/TransactionHistory'
 import { ToastContainer, useToast } from './components/Toast'
 import { useFreighter } from './hooks/useFreighter'
 import { useSolanaWallet } from './hooks/useSolanaWallet'
@@ -9,8 +7,14 @@ import { useEthereumWallet } from './hooks/useEthereumWallet'
 import { useNetworkMode } from './lib/useNetworkMode'
 import { pingBackendWake } from './lib/wakeBackend'
 import { isMainnetEnabled } from './config/networks'
-import NetworkMismatchBanner from './components/NetworkMismatchBanner'
-import MainnetVersionBanner from './components/MainnetVersionBanner'
+
+// Non-critical components are lazy-loaded so the initial bridge form bundle
+// stays as small as possible. Suspense boundaries provide invisible fallbacks
+// because all three sections progressively enhance the core swap flow.
+const DarkVeil = lazy(() => import('./components/DarkVeil'));
+const TransactionHistory = lazy(() => import('./components/TransactionHistory'));
+const NetworkMismatchBanner = lazy(() => import('./components/NetworkMismatchBanner'));
+const MainnetVersionBanner = lazy(() => import('./components/MainnetVersionBanner'));
 import {
   Activity,
   ArrowRightLeft,
@@ -477,8 +481,10 @@ function App() {
         </div>
       </nav>
 
-      <NetworkMismatchBanner networkState={networkState} />
-      <MainnetVersionBanner networkState={networkState} />
+      <Suspense fallback={null}>
+        <NetworkMismatchBanner networkState={networkState} />
+        <MainnetVersionBanner networkState={networkState} />
+      </Suspense>
 
       {/* Main Content */}
       <main className="relative z-10 mx-auto grid w-full max-w-7xl flex-1 grid-cols-1 gap-10 px-4 pb-24 pt-10 md:px-8 lg:grid-cols-[minmax(0,1fr)_minmax(420px,540px)] lg:items-start lg:pt-16">
@@ -568,26 +574,30 @@ function App() {
             />
           )}
           {activeTab === 'history' && (
-            <TransactionHistory
-              ethAddress={ethAddress}
-              stellarAddress={stellarAddress || ''}
-            />
+            <Suspense fallback={<div className="py-12 text-center text-slate-400 text-sm">Loading history…</div>}>
+              <TransactionHistory
+                ethAddress={ethAddress}
+                stellarAddress={stellarAddress || ''}
+              />
+            </Suspense>
           )}
         </section>
       </main>
 
       <div className="background-depth pointer-events-none fixed inset-0 -z-10 overflow-hidden">
         <div className="dark-veil-layer">
-          <DarkVeil
-            hueShift={0}
-            noiseIntensity={0.008}
-            scanlineIntensity={0.035}
-            scanlineFrequency={1.8}
-            speed={0.9}
-            warpAmount={0.08}
-            resolutionScale={0.72}
-            verticalOffset={0.42}
-          />
+          <Suspense fallback={null}>
+            <DarkVeil
+              hueShift={0}
+              noiseIntensity={0.008}
+              scanlineIntensity={0.035}
+              scanlineFrequency={1.8}
+              speed={0.9}
+              warpAmount={0.08}
+              resolutionScale={0.72}
+              verticalOffset={0.42}
+            />
+          </Suspense>
         </div>
       </div>
 
