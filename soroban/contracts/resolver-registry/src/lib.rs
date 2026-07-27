@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 //! Open resolver registry for the WaffleFinance bridge.
 //!
 //! Resolvers stake a configurable amount of a chosen token to become
@@ -54,6 +54,33 @@ use soroban_sdk::{
     symbol_short, token, Address, Env, Symbol, Vec,
 };
 
+/// Explicit lifecycle stage for a resolver entry.
+///
+/// Replaces the implicit `active: bool` signal with a machine-checkable
+/// three-way state so callers and indexers can reason about stake policy
+/// without relying on ad hoc boolean combinations.
+///
+/// Permitted transitions:
+/// ```text
+///  Active ──────────────► Unbonding ──────────────► (removed on withdraw_stake)
+///    │                        │
+///    └────────────────► Inactive ◄──────────────────┘ (slash below min_stake)
+/// ```
+#[contracttype]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ResolverLifecycle {
+    /// Resolver is staked above the minimum and eligible to fill orders.
+    Active = 0,
+    /// Resolver has called `request_unregister`; stake is locked during
+    /// the unbonding window and fully slashable, but the resolver is
+    /// ineligible for new orders.
+    Unbonding = 1,
+    /// Resolver's stake fell below the minimum due to a slash event.
+    /// The resolver cannot fill orders and must complete a full exit cycle
+    /// (`withdraw_stake` + `register`) to re-enter.
+    Inactive = 2,
+}
+
 #[cfg(test)]
 mod test;
 
@@ -102,10 +129,15 @@ pub struct ResolverInfo {
     pub registered_at: u64,
     pub last_slash_at: u64,
     pub total_slashed: i128,
+    /// Kept for backward-compatibility with on-chain reads; always kept
+    /// in sync with `lifecycle`. Prefer `lifecycle` for policy decisions.
     pub active: bool,
     /// Unix timestamp after which `withdraw_stake` becomes valid.
     /// `None` means no unbonding is in progress (normal active state).
     pub unbonding_at: Option<u64>,
+    /// Machine-checkable lifecycle stage — the authoritative source for
+    /// resolver state. Replaces the implicit `active` boolean.
+    pub lifecycle: ResolverLifecycle,
 }
 
 #[contracttype]
@@ -211,6 +243,7 @@ impl ResolverRegistry {
             total_slashed: 0,
             active: true,
             unbonding_at: None,
+            lifecycle: ResolverLifecycle::Active,
         };
         env.storage()
             .persistent()
@@ -308,6 +341,7 @@ impl ResolverRegistry {
         // to this resolver.
         info.active = false;
         info.unbonding_at = Some(unbond_ready_at);
+        info.lifecycle = ResolverLifecycle::Unbonding;
 
         env.storage()
             .persistent()
@@ -413,12 +447,14 @@ impl ResolverRegistry {
             .checked_add(take)
             .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
         info.last_slash_at = env.ledger().timestamp();
-        // Only deactivate by slash if not already inactive / unbonding.
-        // (An unbonding resolver is already inactive; we must not
-        //  accidentally flip active back to true here.)
+        // Transition to Inactive when stake falls below the minimum.
+        // This applies from Active OR Unbonding — a resolver cannot retain
+        // Unbonding status if the remaining stake no longer meets the floor.
+        // Inactive stays Inactive regardless of the slash amount.
         let min_stake: i128 = env.storage().instance().get(&DataKey::MinStake).unwrap_or(0);
-        if info.active && info.stake < min_stake {
+        if info.stake < min_stake && info.lifecycle != ResolverLifecycle::Inactive {
             info.active = false;
+            info.lifecycle = ResolverLifecycle::Inactive;
         }
         env.storage()
             .persistent()

@@ -5,6 +5,7 @@ use proptest::prelude::*;
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{Address, Env};
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
+use std::vec::Vec;
 
 // Sequence of registry actions
 #[derive(Clone, Debug)]
@@ -44,32 +45,33 @@ proptest!{
         };
 
         let admin = Address::generate(&env);
-        let contract_id = env.register(ResolverRegistry, (admin.clone(), asset.clone(), 100i128, Address::generate(&env), DEFAULT_UNBONDING_PERIOD_SECS));
+        let slash_beneficiary = Address::generate(&env);
+        let contract_id = env.register(ResolverRegistry, (admin.clone(), asset.clone(), 100i128, slash_beneficiary.clone(), DEFAULT_UNBONDING_PERIOD_SECS));
         let client = ResolverRegistryClient::new(&env, &contract_id);
 
         // prepare resolver accounts
         let mut resolvers: Vec<Address> = Vec::new();
         for _ in 0..6 { let a = Address::generate(&env); sac.mint(&a, &10_000_0000000); resolvers.push(a); }
 
-        let initial_total: i128 = resolvers.iter().map(|a| token_client.balance(a)).sum::<i128>() + token_client.balance(&client.address);
+        let initial_total: i128 = resolvers.iter().map(|a| token_client.balance(a)).sum::<i128>() + token_client.balance(&client.address) + token_client.balance(&slash_beneficiary);
 
         for act in seq {
             match act {
                 Action::Register { stake } => {
                     let idx = (env.ledger().sequence() as usize) % resolvers.len();
                     let who = resolvers[idx].clone();
-                    let _ = std::panic::catch_unwind(|| client.register(&who, &stake));
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client.register(&who, &stake)));
                 }
                 Action::Increase { idx, additional } => {
-                    if let Some(who) = resolvers.get(idx) { let _ = std::panic::catch_unwind(|| client.increase_stake(who, &additional)); }
+                    if let Some(who) = resolvers.get(idx) { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client.increase_stake(who, &additional))); }
                 }
-                Action::RequestUnregister { idx } => { if let Some(who) = resolvers.get(idx) { let _ = std::panic::catch_unwind(|| client.request_unregister(who)); } }
-                Action::Withdraw { idx } => { if let Some(who) = resolvers.get(idx) { let _ = std::panic::catch_unwind(|| client.withdraw_stake(who)); } }
-                Action::Slash { idx, amount } => { let admin_caller = admin.clone(); let _ = std::panic::catch_unwind(|| client.slash(&resolvers[idx % resolvers.len()], &amount)); }
+                Action::RequestUnregister { idx } => { if let Some(who) = resolvers.get(idx) { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client.request_unregister(who))); } }
+                Action::Withdraw { idx } => { if let Some(who) = resolvers.get(idx) { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client.withdraw_stake(who))); } }
+                Action::Slash { idx, amount } => { let admin_caller = admin.clone(); let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client.slash(&resolvers[idx % resolvers.len()], &amount))); }
             }
         }
 
-        let final_total: i128 = resolvers.iter().map(|a| token_client.balance(a)).sum::<i128>() + token_client.balance(&client.address);
+        let final_total: i128 = resolvers.iter().map(|a| token_client.balance(a)).sum::<i128>() + token_client.balance(&client.address) + token_client.balance(&slash_beneficiary);
         prop_assert_eq!(initial_total, final_total);
     }
 }
