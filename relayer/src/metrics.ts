@@ -268,3 +268,293 @@ export const settlementMetrics = {
   verificationTotal: settlementVerificationTotal,
   proofReplaysTotal: settlementProofReplaysTotal,
 } as const;
+
+// ---------------------------------------------------------------------------
+// Correlation context metrics  (feature a)
+// ---------------------------------------------------------------------------
+
+/**
+ * Total relay operations entered via `withCorrelation`, labelled by outcome
+ * and route. Lets operators count how many relay attempts succeeded / failed
+ * per bridge direction.
+ */
+export const correlationOpsTotal = new Counter({
+  name: 'relayer_correlation_ops_total',
+  help: 'Total relay operations tracked by the correlation context',
+  labelNames: ['route', 'outcome'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total lifecycle checkpoints reached across all relay operations, labelled
+ * by checkpoint name and route. A checkpoint series per order lets operators
+ * reconstruct the path taken through the relay pipeline from logs + metrics.
+ */
+export const correlationCheckpointsTotal = new Counter({
+  name: 'relayer_correlation_checkpoints_total',
+  help: 'Total relay lifecycle checkpoints recorded by the correlation context',
+  labelNames: ['checkpoint', 'route'] as const,
+  registers: [registry],
+});
+
+/**
+ * Duration histogram for relay operations. Separate from individual RPC
+ * timings — measures total wall-clock time from withCorrelation entry to exit.
+ */
+export const correlationOpDurationSeconds = new Histogram({
+  name: 'relayer_correlation_op_duration_seconds',
+  help: 'Wall-clock duration of a full relay operation from start to completion or failure',
+  labelNames: ['route'] as const,
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60, 120],
+  registers: [registry],
+});
+
+/**
+ * Total retry hops recorded inside correlation scopes, labelled by route and
+ * reason. Operators can track whether retries are dominated by RPC rate limits,
+ * chain confirmation gaps, or Horizon timeouts.
+ */
+export const correlationRetryHopsTotal = new Counter({
+  name: 'relayer_correlation_retry_hops_total',
+  help: 'Total intra-correlation retry hops (each incrementRetry call)',
+  labelNames: ['route', 'reason'] as const,
+  registers: [registry],
+});
+
+/** Correlation metrics bundle — useful for test assertions. */
+export const correlationMetrics = {
+  opsTotal: correlationOpsTotal,
+  checkpointsTotal: correlationCheckpointsTotal,
+  opDuration: correlationOpDurationSeconds,
+  retryHops: correlationRetryHopsTotal,
+} as const;
+
+// ---------------------------------------------------------------------------
+// Fee / profitability model metrics  (feature b)
+// ---------------------------------------------------------------------------
+
+/**
+ * Total relay decisions made by the fee model, labelled by verdict
+ * (profitable | neutral | unprofitable | error) and route.
+ */
+export const feeRelayDecisionsTotal = new Counter({
+  name: 'relayer_fee_relay_decisions_total',
+  help: 'Total relay decisions emitted by the fee model, by verdict and route',
+  labelNames: ['verdict', 'route'] as const,
+  registers: [registry],
+});
+
+/**
+ * Estimated gas cost in USD for each relay decision. Helps operators track
+ * total gas spend over time and spot fee spikes.
+ */
+export const feeGasCostUsdHistogram = new Histogram({
+  name: 'relayer_fee_gas_cost_usd',
+  help: 'Estimated gas cost in USD for each relay decision',
+  labelNames: ['route'] as const,
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 25],
+  registers: [registry],
+});
+
+/**
+ * Net profit (or loss) in USD for each relay decision. Negative values
+ * indicate unprofitable relays (gas + safety deposit > expected payout).
+ * The histogram uses signed buckets to capture loss regions.
+ */
+export const feeNetProfitUsdHistogram = new Histogram({
+  name: 'relayer_fee_net_profit_usd',
+  help: 'Estimated net profit (payout - gas - safety deposit) in USD per relay decision',
+  labelNames: ['route'] as const,
+  buckets: [-10, -5, -2, -1, -0.5, 0, 0.5, 1, 2, 5, 10, 25, 50],
+  registers: [registry],
+});
+
+/**
+ * Safety deposit amount in USD observed at relay decision time. Useful for
+ * confirming the dynamic deposit model is within expected bounds.
+ */
+export const feeSafetyDepositUsdHistogram = new Histogram({
+  name: 'relayer_fee_safety_deposit_usd',
+  help: 'Safety deposit amount in USD at relay decision time',
+  labelNames: ['route'] as const,
+  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5],
+  registers: [registry],
+});
+
+/**
+ * Total number of relays skipped because the fee model determined they were
+ * economically unattractive (verdict = unprofitable), labelled by route.
+ */
+export const feeSkippedRelaysTotal = new Counter({
+  name: 'relayer_fee_skipped_relays_total',
+  help: 'Total relay actions skipped by the fee model due to unprofitable verdict',
+  labelNames: ['route'] as const,
+  registers: [registry],
+});
+
+/** Fee model metrics bundle — useful for test assertions. */
+export const feeMetrics = {
+  decisionsTotal: feeRelayDecisionsTotal,
+  gasCostUsd: feeGasCostUsdHistogram,
+  netProfitUsd: feeNetProfitUsdHistogram,
+  safetyDepositUsd: feeSafetyDepositUsdHistogram,
+  skippedRelays: feeSkippedRelaysTotal,
+} as const;
+
+// ---------------------------------------------------------------------------
+// Transaction state reconciliation metrics  (feature c)
+// ---------------------------------------------------------------------------
+
+/**
+ * Total state transitions recorded in the TxStateStore, labelled by
+ * from_state → to_state. Lets operators build a state-flow graph and spot
+ * orders stuck in unexpected states.
+ */
+export const txStateTransitionsTotal = new Counter({
+  name: 'relayer_tx_state_transitions_total',
+  help: 'Total transaction state transitions in the TxStateStore',
+  labelNames: ['from_state', 'to_state'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total reconciliation sweeps run by the TxStateStore. Each sweep walks
+ * all in-flight records and attempts to advance or recover them.
+ */
+export const txStateReconciliationsTotal = new Counter({
+  name: 'relayer_tx_state_reconciliations_total',
+  help: 'Total TxStateStore reconciliation sweep executions',
+  labelNames: ['trigger'] as const,   // 'startup' | 'scheduled' | 'manual'
+  registers: [registry],
+});
+
+/**
+ * Total records recovered during a reconciliation sweep (state advanced after
+ * restart or missed receipt).
+ */
+export const txStateRecoveredTotal = new Counter({
+  name: 'relayer_tx_state_recovered_total',
+  help: 'Total TxStateStore records successfully recovered during reconciliation',
+  labelNames: ['recovered_to_state'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total duplicate receipts rejected by the TxStateStore (idempotency guard).
+ */
+export const txStateDuplicateReceiptsTotal = new Counter({
+  name: 'relayer_tx_state_duplicate_receipts_total',
+  help: 'Total duplicate receipt submissions rejected by the TxStateStore',
+  registers: [registry],
+});
+
+/**
+ * Current number of records in each state, sampled at each reconciliation sweep.
+ */
+export const txStateCurrentByState = new Gauge({
+  name: 'relayer_tx_state_current_by_state',
+  help: 'Current count of TxStateStore records in each state',
+  labelNames: ['state'] as const,
+  registers: [registry],
+});
+
+/**
+ * Duration of each reconciliation sweep in seconds.
+ */
+export const txStateReconciliationDurationSeconds = new Histogram({
+  name: 'relayer_tx_state_reconciliation_duration_seconds',
+  help: 'Duration of a full TxStateStore reconciliation sweep',
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5],
+  registers: [registry],
+});
+
+/** TxState metrics bundle — useful for test assertions. */
+export const txStateMetrics = {
+  transitionsTotal: txStateTransitionsTotal,
+  reconciliationsTotal: txStateReconciliationsTotal,
+  recoveredTotal: txStateRecoveredTotal,
+  duplicateReceipts: txStateDuplicateReceiptsTotal,
+  currentByState: txStateCurrentByState,
+  reconciliationDuration: txStateReconciliationDurationSeconds,
+} as const;
+
+// ---------------------------------------------------------------------------
+// Retry engine metrics  (feature d)
+// ---------------------------------------------------------------------------
+
+/**
+ * Total retry attempts made by the RetryEngine, labelled by fault_class
+ * (transient | confirmation_delay | terminal) and action (the operation name).
+ */
+export const retryEngineAttemptsTotal = new Counter({
+  name: 'relayer_retry_engine_attempts_total',
+  help: 'Total retry attempts made by the RetryEngine',
+  labelNames: ['fault_class', 'action'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total operations that permanently failed after exhausting all retries,
+ * labelled by fault_class and action.
+ */
+export const retryEngineExhaustedTotal = new Counter({
+  name: 'relayer_retry_engine_exhausted_total',
+  help: 'Total RetryEngine operations that permanently failed after all retry attempts',
+  labelNames: ['fault_class', 'action'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total operations where the circuit breaker opened (tripped after repeated
+ * failures), labelled by action (the operation namespace protected).
+ */
+export const retryEngineCircuitOpenedTotal = new Counter({
+  name: 'relayer_retry_engine_circuit_opened_total',
+  help: 'Total circuit-breaker trips in the RetryEngine',
+  labelNames: ['action'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total operations blocked by an open circuit breaker (fast-fail before
+ * attempting the underlying operation), labelled by action.
+ */
+export const retryEngineCircuitRejectedTotal = new Counter({
+  name: 'relayer_retry_engine_circuit_rejected_total',
+  help: 'Total calls fast-failed by an open circuit breaker in the RetryEngine',
+  labelNames: ['action'] as const,
+  registers: [registry],
+});
+
+/**
+ * Current circuit breaker state as a gauge: 0 = closed (healthy), 1 = open
+ * (failing fast). Useful for alerting on persistent circuit trips.
+ */
+export const retryEngineCircuitState = new Gauge({
+  name: 'relayer_retry_engine_circuit_state',
+  help: '1 when the circuit breaker is open (failing fast), 0 when closed',
+  labelNames: ['action'] as const,
+  registers: [registry],
+});
+
+/**
+ * Backoff delay duration histogram. Records the actual delay applied before
+ * each retry so operators can verify the backoff progression.
+ */
+export const retryEngineBackoffSeconds = new Histogram({
+  name: 'relayer_retry_engine_backoff_seconds',
+  help: 'Backoff delay applied before each retry attempt',
+  labelNames: ['fault_class', 'action'] as const,
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60],
+  registers: [registry],
+});
+
+/** Retry engine metrics bundle — useful for test assertions. */
+export const retryEngineMetrics = {
+  attemptsTotal: retryEngineAttemptsTotal,
+  exhaustedTotal: retryEngineExhaustedTotal,
+  circuitOpenedTotal: retryEngineCircuitOpenedTotal,
+  circuitRejectedTotal: retryEngineCircuitRejectedTotal,
+  circuitState: retryEngineCircuitState,
+  backoffSeconds: retryEngineBackoffSeconds,
+} as const;
