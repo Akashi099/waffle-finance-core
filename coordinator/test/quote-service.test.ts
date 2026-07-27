@@ -296,4 +296,95 @@ describe("QuoteService — SWR caching", () => {
     // 4000 / 0.20 = 20000
     expect(snap.rate).toBeCloseTo(20_000, 2);
   });
+
+  // ── #285: invalidate ──────────────────────────────────────────────────────
+
+  it("invalidate() evicts the pair so the next call blocks on a fresh fetch", async () => {
+    fetchMock.mockResolvedValueOnce(cgResponse(3000, 0.10));
+    fetchMock.mockResolvedValueOnce(cgResponse(4000, 0.20));
+
+    const svc = new QuoteService(NOOP_LOGGER, { freshTtlMs: 60_000, staleTtlMs: 120_000, maxStaleTtlMs: 300_000 });
+
+    // 1. Cold-start fetch → 3000
+    const before = await svc.getQuote("ETH-XLM");
+    expect(before.srcUsd).toBe(3000);
+
+    // 2. Invalidate — cache is cleared
+    svc.invalidate("ETH-XLM");
+
+    // 3. Next call must hit upstream (cache is empty)
+    const after = await svc.getQuote("ETH-XLM");
+    expect(after.srcUsd).toBe(4000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidate() on an uncached pair is a no-op (does not throw)", () => {
+    const svc = new QuoteService(NOOP_LOGGER);
+    expect(() => svc.invalidate("ETH-XLM")).not.toThrow();
+  });
+
+  it("invalidate() only clears the target pair, leaving other pairs intact", async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes("stellar")) return Promise.resolve(cgResponse(3000, 0.10));
+      return Promise.resolve(cgSolResponse(3000, 160));
+    });
+
+    const svc = new QuoteService(NOOP_LOGGER, { freshTtlMs: 60_000, staleTtlMs: 120_000, maxStaleTtlMs: 300_000 });
+    await svc.getQuote("ETH-XLM");
+    await svc.getQuote("ETH-SOL");
+
+    // Invalidate only the XLM pair
+    svc.invalidate("ETH-XLM");
+
+    // SOL pair is still cached — no additional upstream call
+    nowMs += 1_000;
+    const solSnap = await svc.getQuote("ETH-SOL");
+    expect(solSnap.staleness).toBe("fresh");
+    expect(solSnap.dstUsd).toBe(160);
+  });
+
+  // ── #285: getCacheStats ───────────────────────────────────────────────────
+
+  it("getCacheStats() returns empty object when cache is cold", () => {
+    const svc = new QuoteService(NOOP_LOGGER);
+    expect(svc.getCacheStats()).toEqual({});
+  });
+
+  it("getCacheStats() returns an entry with correct freshness after a live fetch", async () => {
+    fetchMock.mockResolvedValueOnce(cgResponse(3500, 0.11));
+
+    const svc = new QuoteService(NOOP_LOGGER, { freshTtlMs: 15_000, staleTtlMs: 60_000, maxStaleTtlMs: 300_000 });
+    await svc.getQuote("ETH-XLM");
+
+    const stats = svc.getCacheStats();
+    expect(stats["ETH-XLM"]).toBeDefined();
+    expect(stats["ETH-XLM"].pair).toBe("ETH-XLM");
+    expect(stats["ETH-XLM"].staleness).toBe("fresh");
+    expect(stats["ETH-XLM"].isFallback).toBe(false);
+    expect(stats["ETH-XLM"].ageMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("getCacheStats() reports staleness correctly when data ages into stale window", async () => {
+    fetchMock.mockResolvedValueOnce(cgResponse(3500, 0.11));
+
+    const svc = new QuoteService(NOOP_LOGGER, { freshTtlMs: 5_000, staleTtlMs: 60_000, maxStaleTtlMs: 300_000 });
+    await svc.getQuote("ETH-XLM");
+
+    // Advance past freshTtlMs
+    nowMs += 10_000;
+
+    const stats = svc.getCacheStats();
+    expect(stats["ETH-XLM"].staleness).toBe("stale");
+  });
+
+  it("getCacheStats() reports isFallback:true after an upstream failure", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("upstream down"));
+
+    const svc = new QuoteService(NOOP_LOGGER);
+    await svc.getQuote("ETH-XLM"); // returns hardcoded fallback (not cached)
+
+    // Hardcoded fallback is not written to cache on cold start, so stats is empty.
+    const stats = svc.getCacheStats();
+    expect(Object.keys(stats)).toHaveLength(0);
+  });
 });

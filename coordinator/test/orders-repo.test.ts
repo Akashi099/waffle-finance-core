@@ -225,3 +225,132 @@ describe("OrdersRepository.recordDstLock", () => {
     ).resolves.toBeUndefined();
   });
 });
+
+// ── #310: recordSecretRevealed idempotence ────────────────────────────────────
+
+describe("OrdersRepository.recordSecretRevealed", () => {
+  const PREIMAGE = "0x" + "aa".repeat(32);
+  const TX = "0xreveal";
+
+  it("transitions dst_locked -> secret_revealed and persists the preimage", async () => {
+    const repo = await freshRepo();
+    const order = await announce(repo);
+    await repo.recordSrcLock({ publicId: order.publicId, ...SRC_LOCK });
+    await repo.recordDstLock({ publicId: order.publicId, ...DST_LOCK });
+
+    await repo.recordSecretRevealed({ publicId: order.publicId, preimage: PREIMAGE, txHash: TX });
+
+    const updated = await repo.findByPublicId(order.publicId);
+    expect(updated!.status).toBe("secret_revealed");
+    expect(updated!.preimage).toBe(PREIMAGE);
+    expect(updated!.secretRevealedTx).toBe(TX);
+  });
+
+  it("is idempotent — same preimage delivered twice leaves the order unchanged", async () => {
+    const repo = await freshRepo();
+    const order = await announce(repo);
+    await repo.recordSrcLock({ publicId: order.publicId, ...SRC_LOCK });
+    await repo.recordDstLock({ publicId: order.publicId, ...DST_LOCK });
+
+    await repo.recordSecretRevealed({ publicId: order.publicId, preimage: PREIMAGE, txHash: TX });
+    await repo.recordSecretRevealed({ publicId: order.publicId, preimage: PREIMAGE, txHash: "0xreplay" });
+
+    const updated = await repo.findByPublicId(order.publicId);
+    expect(updated!.status).toBe("secret_revealed");
+    expect(updated!.preimage).toBe(PREIMAGE);
+    // txHash must not have been overwritten by the replay
+    expect(updated!.secretRevealedTx).toBe(TX);
+  });
+
+  it.each(TERMINAL_STATUSES)(
+    "is a full no-op for terminal order in status %s",
+    async (status) => {
+      const repo = await freshRepo();
+      const order = await announce(repo);
+      await repo.setStatus(order.publicId, status);
+
+      await repo.recordSecretRevealed({ publicId: order.publicId, preimage: PREIMAGE, txHash: TX });
+
+      const updated = await repo.findByPublicId(order.publicId);
+      expect(updated!.status).toBe(status);
+      expect(updated!.preimage).toBeNull();
+    }
+  );
+
+  it("does nothing for an unknown order", async () => {
+    const repo = await freshRepo();
+    await expect(
+      repo.recordSecretRevealed({ publicId: "no-such-order", preimage: PREIMAGE, txHash: TX })
+    ).resolves.toBeUndefined();
+  });
+});
+
+// ── #310: durable transition event trail ─────────────────────────────────────
+
+describe("OrdersRepository — transition event trail", () => {
+  it("appends a transitioned event when src lock advances the order", async () => {
+    const repo = await freshRepo();
+    const order = await announce(repo);
+
+    await repo.recordSrcLock({ publicId: order.publicId, ...SRC_LOCK, actor: "eth-listener" });
+
+    const events = await repo.findTransitionEvents(order.publicId);
+    expect(events.length).toBeGreaterThanOrEqual(1);
+    const ev = events.find((e) => e.eventType === "src_lock.transitioned");
+    expect(ev).toBeDefined();
+    expect(ev!.payload.fromStatus).toBe("announced");
+    expect(ev!.payload.toStatus).toBe("src_locked");
+    expect(ev!.payload.actor).toBe("eth-listener");
+    expect(ev!.payload.outcome).toBe("transitioned");
+  });
+
+  it("appends a no_op event (terminal) when a terminal order receives a replayed lock", async () => {
+    const repo = await freshRepo();
+    const order = await announce(repo);
+    await repo.setStatus(order.publicId, "completed");
+
+    await repo.recordSrcLock({ publicId: order.publicId, ...SRC_LOCK });
+
+    const events = await repo.findTransitionEvents(order.publicId);
+    const noOp = events.find((e) => e.eventType === "src_lock.no_op");
+    expect(noOp).toBeDefined();
+    expect(noOp!.payload.outcome).toBe("no_op:terminal");
+  });
+
+  it("appends a no_op:idempotent event when the same preimage is delivered twice", async () => {
+    const repo = await freshRepo();
+    const order = await announce(repo);
+    await repo.recordSrcLock({ publicId: order.publicId, ...SRC_LOCK });
+    await repo.recordDstLock({ publicId: order.publicId, ...DST_LOCK });
+
+    const PREIMAGE = "0x" + "bb".repeat(32);
+    await repo.recordSecretRevealed({ publicId: order.publicId, preimage: PREIMAGE, txHash: "0x1" });
+    await repo.recordSecretRevealed({ publicId: order.publicId, preimage: PREIMAGE, txHash: "0x2" });
+
+    const events = await repo.findTransitionEvents(order.publicId);
+    const idempotent = events.find(
+      (e) => e.eventType === "secret_revealed.no_op" && e.payload.outcome === "no_op:idempotent"
+    );
+    expect(idempotent).toBeDefined();
+  });
+
+  it("records a status.transitioned event for setStatus calls", async () => {
+    const repo = await freshRepo();
+    const order = await announce(repo);
+
+    await repo.setStatus(order.publicId, "failed", "operator");
+
+    const events = await repo.findTransitionEvents(order.publicId);
+    const ev = events.find((e) => e.eventType === "status.transitioned");
+    expect(ev).toBeDefined();
+    expect(ev!.payload.fromStatus).toBe("announced");
+    expect(ev!.payload.toStatus).toBe("failed");
+    expect(ev!.payload.actor).toBe("operator");
+  });
+
+  it("returns empty array for an order with no recorded events", async () => {
+    const repo = await freshRepo();
+    const events = await repo.findTransitionEvents("wf_0x" + "00".repeat(32));
+    expect(events).toHaveLength(0);
+  });
+});

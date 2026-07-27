@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { keccak256, toHex, parseAbiItem, type PublicClient, type Log } from "viem";
 import type { Logger } from "pino";
 import type { OrderService } from "../services/order-service.js";
+import { secretRecoveryOutcomeTotal } from "../metrics.js";
 
 // ── Validation helpers ────────────────────────────────────────────────────────
 
@@ -54,7 +55,27 @@ export interface SecretRecoveryResult {
   invalidPreimages: number;
   /** Orders where the preimage was already present in DB (idempotent skip). */
   alreadyKnown: number;
+  /**
+   * Orders where the preimage passed hash validation but the order was in a state
+   * that does not accept secret recording (e.g. already terminal). Never persisted.
+   */
+  stateConflict: number;
+  /** Unexpected errors during individual order processing — order skipped. */
+  errors: number;
 }
+
+/**
+ * Deterministic outcome of a single recovery attempt for one order.
+ *
+ * Used internally by `_recoverOneOrder` and exposed for callers that want to
+ * react to individual outcomes (e.g. operator tooling or integration tests).
+ */
+export type RecoveryOutcome =
+  | "recovered"
+  | "already_known"
+  | "invalid_preimage"
+  | "state_conflict"
+  | "error";
 
 export interface StaleRevelation {
   publicId: string;
@@ -109,6 +130,64 @@ export class SecretReconciler {
   }
 
   /**
+   * Recover a preimage for a single order deterministically.
+   *
+   * This is the shared recovery path for every branch of the engine.  It
+   * validates the preimage, classifies the outcome, persists only safe values,
+   * and increments the appropriate metric counter so operators can see which
+   * branch fires most often.
+   */
+  async _recoverOneOrder(
+    orderId: string,
+    preimage: string,
+    txHash: string,
+  ): Promise<RecoveryOutcome> {
+    const order = await this.orders.findBySrcOrderId("ethereum", orderId);
+    if (!order) {
+      this.log.debug({ orderId }, "SecretReconciler: no DB order for on-chain orderId — skipping");
+      return "error";
+    }
+
+    if (order.preimage) {
+      secretRecoveryOutcomeTotal.inc({ outcome: "already_known" });
+      return "already_known";
+    }
+
+    const algo = validatePreimage(preimage, order.hashlock);
+    if (!algo) {
+      secretRecoveryOutcomeTotal.inc({ outcome: "invalid_preimage" });
+      this.log.warn(
+        { orderId, publicId: order.publicId, hashlock: order.hashlock },
+        "SecretReconciler: recovered preimage does not match hashlock — rejected",
+      );
+      return "invalid_preimage";
+    }
+
+    try {
+      await this.orders.recordSecret(order.publicId, preimage, txHash);
+    } catch (err: any) {
+      if (err?.message?.includes("cannot record")) {
+        secretRecoveryOutcomeTotal.inc({ outcome: "state_conflict" });
+        this.log.warn(
+          { orderId, publicId: order.publicId, status: order.status, err: err.message },
+          "SecretReconciler: order state does not accept secret recording",
+        );
+        return "state_conflict";
+      }
+      secretRecoveryOutcomeTotal.inc({ outcome: "error" });
+      this.log.warn({ err, orderId }, "SecretReconciler: unexpected error recording secret");
+      return "error";
+    }
+
+    secretRecoveryOutcomeTotal.inc({ outcome: "recovered" });
+    this.log.info(
+      { orderId, publicId: order.publicId, algo, txHash },
+      "SecretReconciler: missing secret recovered from on-chain log",
+    );
+    return "recovered";
+  }
+
+  /**
    * Scan Ethereum `OrderClaimed` logs in `[fromBlock, toBlock]` and recover
    * any preimages missing from the coordinator's database.
    *
@@ -121,7 +200,13 @@ export class SecretReconciler {
     fromBlock: bigint,
     toBlock: bigint,
   ): Promise<SecretRecoveryResult> {
-    const result: SecretRecoveryResult = { recovered: 0, invalidPreimages: 0, alreadyKnown: 0 };
+    const result: SecretRecoveryResult = {
+      recovered: 0,
+      invalidPreimages: 0,
+      alreadyKnown: 0,
+      stateConflict: 0,
+      errors: 0,
+    };
 
     let logs: Log[];
     try {
@@ -155,41 +240,13 @@ export class SecretReconciler {
       const preimage = args.preimage;
       const txHash = log.transactionHash ?? "0x";
 
-      try {
-        const order = await this.orders.findBySrcOrderId("ethereum", orderId);
-        if (!order) {
-          this.log.debug(
-            { orderId },
-            "SecretReconciler: no DB order for on-chain orderId — skipping",
-          );
-          continue;
-        }
-
-        if (order.preimage) {
-          result.alreadyKnown++;
-          continue;
-        }
-
-        // Validate against the order's hashlock before writing.
-        const algo = validatePreimage(preimage, order.hashlock);
-        if (!algo) {
-          result.invalidPreimages++;
-          this.log.warn(
-            { orderId, publicId: order.publicId, hashlock: order.hashlock },
-            "SecretReconciler: recovered preimage does not match hashlock — rejected",
-          );
-          continue;
-        }
-
-        await this.orders.recordSecret(order.publicId, preimage, txHash);
-        result.recovered++;
-        this.log.info(
-          { orderId, publicId: order.publicId, algo, txHash },
-          "SecretReconciler: missing secret recovered from on-chain log",
-        );
-      } catch (err: any) {
-        if (err?.message?.includes("cannot record")) continue;
-        this.log.warn({ err, orderId }, "SecretReconciler: error processing OrderClaimed log");
+      const outcome = await this._recoverOneOrder(orderId, preimage, txHash);
+      switch (outcome) {
+        case "recovered":      result.recovered++;      break;
+        case "already_known":  result.alreadyKnown++;   break;
+        case "invalid_preimage": result.invalidPreimages++; break;
+        case "state_conflict": result.stateConflict++;  break;
+        case "error":          result.errors++;         break;
       }
     }
 

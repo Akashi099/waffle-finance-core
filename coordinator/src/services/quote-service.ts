@@ -153,6 +153,41 @@ export class QuoteService {
   }
 
   /**
+   * Evict a pair from the in-memory cache, forcing the next caller to block
+   * on a fresh upstream fetch.  Safe to call from operator tooling or tests.
+   * If the pair is not cached this is a no-op.
+   */
+  invalidate(pair: string): void {
+    this.cache.delete(pair);
+    this.log.info({ pair }, "quote cache invalidated");
+  }
+
+  /**
+   * Return a snapshot of the current cache state for observability.
+   *
+   * Each entry includes the pair key, how old the cached data is, whether it
+   * is a fallback value, and its staleness classification at the moment of the
+   * call.  Useful for health-check endpoints and dashboards.
+   */
+  getCacheStats(): Record<string, { pair: string; ageMs: number; isFallback: boolean; staleness: QuoteStaleness }> {
+    const now = Date.now();
+    const stats: Record<string, { pair: string; ageMs: number; isFallback: boolean; staleness: QuoteStaleness }> = {};
+    for (const [key, entry] of this.cache) {
+      const ageMs = now - entry.fetchedAt;
+      let staleness: QuoteStaleness;
+      if (entry.isFallback) {
+        staleness = "fallback";
+      } else if (ageMs < this.freshTtlMs) {
+        staleness = "fresh";
+      } else {
+        staleness = "stale";
+      }
+      stats[key] = { pair: entry.pair, ageMs, isFallback: entry.isFallback, staleness };
+    }
+    return stats;
+  }
+
+  /**
    * Convenience wrapper for the ETH/XLM pair — preserves backwards compat
    * with code that calls `quoteEthXlm()` directly.
    */

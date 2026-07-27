@@ -123,6 +123,8 @@ describe("SecretReconciler — recoverFromEthereumLogs", () => {
       recovered: 0,
       invalidPreimages: 0,
       alreadyKnown: 0,
+      stateConflict: 0,
+      errors: 0,
     });
   });
 
@@ -271,7 +273,7 @@ describe("SecretReconciler — recoverFromEthereumLogs", () => {
     const client = { getLogs: vi.fn(async () => { throw new Error("RPC timeout"); }) };
     const reconciler = new SecretReconciler(client as any, orders, log);
     const result = await reconciler.recoverFromEthereumLogs("0xcontract", 1n, 100n);
-    expect(result).toEqual({ recovered: 0, invalidPreimages: 0, alreadyKnown: 0 });
+    expect(result).toEqual<SecretRecoveryResult>({ recovered: 0, invalidPreimages: 0, alreadyKnown: 0, stateConflict: 0, errors: 0 });
   });
 
   it("is idempotent — running twice does not double-write", async () => {
@@ -396,5 +398,126 @@ describe("SecretReconciler — detectStaleRevelations", () => {
     const publicIds = stale.map((s) => s.publicId).sort();
     expect(publicIds).toContain(pa);
     expect(publicIds).toContain(pb);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #309: SecretRecoveryResult — stateConflict and errors fields
+// ---------------------------------------------------------------------------
+
+describe("SecretRecoveryResult — stateConflict and errors counters", () => {
+  let orders: OrderService;
+
+  beforeEach(async () => {
+    orders = await freshOrders();
+  });
+
+  it("result includes stateConflict:0 and errors:0 on a clean run", async () => {
+    const client = makeMockClient([]);
+    const reconciler = new SecretReconciler(client as any, orders, log);
+    const result = await reconciler.recoverFromEthereumLogs("0xcontract", 1n, 100n);
+    expect(result.stateConflict).toBe(0);
+    expect(result.errors).toBe(0);
+  });
+
+  it("increments stateConflict when order is in an incompatible state for secret recording", async () => {
+    const publicId = await seedOrder(orders, SHA256_HASHLOCK);
+    // Lock src side so the order is in src_locked, which allows secret_revealed…
+    await orders.recordSrcLock({ publicId, orderId: "200", txHash: "0x", blockNumber: 1, timelock: 9999 });
+    // …but then mark it refunded (terminal) so the service rejects the recording.
+    await orders.markStatus(publicId, "refunded");
+
+    const client = makeMockClient([
+      { args: { orderId: 200n, preimage: SHA256_PREIMAGE }, transactionHash: "0xabc", blockNumber: 50n },
+    ]);
+    const reconciler = new SecretReconciler(client as any, orders, log);
+    const result = await reconciler.recoverFromEthereumLogs("0xcontract", 1n, 100n);
+
+    // The order is terminal — service raises "cannot record secret" which maps to state_conflict.
+    expect(result.stateConflict).toBe(1);
+    expect(result.recovered).toBe(0);
+  });
+
+  it("increments errors when no DB order exists for the log's orderId", async () => {
+    // orderId 999 doesn't exist in the DB — _recoverOneOrder returns "error".
+    const client = makeMockClient([
+      { args: { orderId: 999n, preimage: SHA256_PREIMAGE }, transactionHash: "0x1", blockNumber: 1n },
+    ]);
+    const reconciler = new SecretReconciler(client as any, orders, log);
+    const result = await reconciler.recoverFromEthereumLogs("0xcontract", 1n, 100n);
+    expect(result.errors).toBe(1);
+    expect(result.recovered).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #309: _recoverOneOrder — deterministic outcome per order
+// ---------------------------------------------------------------------------
+
+describe("SecretReconciler._recoverOneOrder", () => {
+  let orders: OrderService;
+
+  beforeEach(async () => {
+    orders = await freshOrders();
+  });
+
+  it("returns 'recovered' when a missing sha256 preimage is written", async () => {
+    const publicId = await seedOrder(orders, SHA256_HASHLOCK);
+    await orders.recordSrcLock({ publicId, orderId: "300", txHash: "0x", blockNumber: 1, timelock: 9999 });
+
+    const reconciler = new SecretReconciler(makeMockClient() as any, orders, log);
+    const outcome = await reconciler._recoverOneOrder("300", SHA256_PREIMAGE, "0xok");
+    expect(outcome).toBe("recovered");
+
+    const updated = await orders.get(publicId);
+    expect(updated?.status).toBe("secret_revealed");
+  });
+
+  it("returns 'already_known' when preimage is already in DB", async () => {
+    const publicId = await seedOrder(orders, SHA256_HASHLOCK);
+    await orders.recordSrcLock({ publicId, orderId: "301", txHash: "0x", blockNumber: 1, timelock: 9999 });
+    await orders.recordSecret(publicId, SHA256_PREIMAGE, "0x");
+
+    const reconciler = new SecretReconciler(makeMockClient() as any, orders, log);
+    const outcome = await reconciler._recoverOneOrder("301", SHA256_PREIMAGE, "0xagain");
+    expect(outcome).toBe("already_known");
+  });
+
+  it("returns 'invalid_preimage' when the preimage does not hash to the hashlock", async () => {
+    const publicId = await seedOrder(orders, SHA256_HASHLOCK);
+    await orders.recordSrcLock({ publicId, orderId: "302", txHash: "0x", blockNumber: 1, timelock: 9999 });
+
+    const BAD = "0x" + "ff".repeat(32);
+    const reconciler = new SecretReconciler(makeMockClient() as any, orders, log);
+    const outcome = await reconciler._recoverOneOrder("302", BAD, "0xbad");
+    expect(outcome).toBe("invalid_preimage");
+  });
+
+  it("returns 'error' when no DB order matches the orderId", async () => {
+    const reconciler = new SecretReconciler(makeMockClient() as any, orders, log);
+    const outcome = await reconciler._recoverOneOrder("999", SHA256_PREIMAGE, "0x");
+    expect(outcome).toBe("error");
+  });
+
+  it("returns 'state_conflict' when the order is terminal and rejects secret recording", async () => {
+    const publicId = await seedOrder(orders, SHA256_HASHLOCK);
+    await orders.recordSrcLock({ publicId, orderId: "303", txHash: "0x", blockNumber: 1, timelock: 9999 });
+    await orders.markStatus(publicId, "refunded");
+
+    const reconciler = new SecretReconciler(makeMockClient() as any, orders, log);
+    const outcome = await reconciler._recoverOneOrder("303", SHA256_PREIMAGE, "0x");
+    expect(outcome).toBe("state_conflict");
+  });
+
+  it("is idempotent — running twice returns 'recovered' then 'already_known'", async () => {
+    const publicId = await seedOrder(orders, SHA256_HASHLOCK);
+    await orders.recordSrcLock({ publicId, orderId: "304", txHash: "0x", blockNumber: 1, timelock: 9999 });
+
+    const reconciler = new SecretReconciler(makeMockClient() as any, orders, log);
+    const first = await reconciler._recoverOneOrder("304", SHA256_PREIMAGE, "0x1");
+    const second = await reconciler._recoverOneOrder("304", SHA256_PREIMAGE, "0x2");
+
+    expect(first).toBe("recovered");
+    expect(second).toBe("already_known");
   });
 });
