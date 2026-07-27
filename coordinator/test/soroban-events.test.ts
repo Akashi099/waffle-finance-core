@@ -298,10 +298,28 @@ describe("decodeHtlcEvent — malformed payloads return MalformedEventError", ()
     expect((result as MalformedEventError).reason).toBe("data_count_mismatch");
   });
 
+  it("data_count_mismatch: 'claimed' with only 4 data elements returns MalformedEventError", () => {
+    const ev = makeClaimedEvent();
+    const original = scValToNative(ev.value) as unknown[];
+    const shortData = nativeToScVal(original.slice(0, 4)) as xdr.ScVal;
+    const result = decodeHtlcEvent(ev.topic, shortData);
+    expect(isMalformedEvent(result)).toBe(true);
+    expect((result as MalformedEventError).reason).toBe("data_count_mismatch");
+  });
+
   it("data_count_mismatch: 'refunded' with empty data returns MalformedEventError", () => {
     const ev = makeRefundedEvent();
     const emptyData = nativeToScVal([]) as xdr.ScVal;
     const result = decodeHtlcEvent(ev.topic, emptyData);
+    expect(isMalformedEvent(result)).toBe(true);
+    expect((result as MalformedEventError).reason).toBe("data_count_mismatch");
+  });
+
+  it("data_count_mismatch: 'refunded' with only 3 data elements returns MalformedEventError", () => {
+    const ev = makeRefundedEvent();
+    const original = scValToNative(ev.value) as unknown[];
+    const shortData = nativeToScVal(original.slice(0, 3)) as xdr.ScVal;
+    const result = decodeHtlcEvent(ev.topic, shortData);
     expect(isMalformedEvent(result)).toBe(true);
     expect((result as MalformedEventError).reason).toBe("data_count_mismatch");
   });
