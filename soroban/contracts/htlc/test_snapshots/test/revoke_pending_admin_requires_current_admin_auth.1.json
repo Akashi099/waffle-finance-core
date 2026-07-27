@@ -193,6 +193,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "ContractMode"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 0
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "MinSafetyDeposit"
                             }
                           ]

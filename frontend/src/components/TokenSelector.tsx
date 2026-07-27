@@ -1,130 +1,98 @@
 import { useState, useEffect, useRef } from 'react';
+import { normalizeAsset, type NormalizedAsset, type SupportedChain } from '../lib/assetNormalization';
 
-// Token tipi
-export interface Token {
-  symbol: string;
-  name: string;
-  logo?: string;
-  balance?: string;
-  chain: 'ethereum' | 'stellar';
-  address?: string;
-  decimals: number;
-}
+// Re-export NormalizedAsset under the legacy name so existing import sites
+// continue to work without changes while new code uses NormalizedAsset directly.
+export type Token = NormalizedAsset;
+export type { NormalizedAsset };
 
 interface TokenSelectorProps {
-  selectedToken?: Token;
-  onSelectToken: (token: Token) => void;
-  chain?: 'ethereum' | 'stellar' | 'all';
+  selectedToken?: NormalizedAsset;
+  onSelectToken: (token: NormalizedAsset) => void;
+  chain?: SupportedChain | 'all';
   label?: string;
 }
+
+const RAW_TOKEN_LIST: Array<{
+  chain: SupportedChain;
+  symbol: string;
+  name: string;
+  logo: string;
+  balance?: string;
+  address?: string;
+  decimals: number;
+}> = [
+  { chain: 'ethereum', symbol: 'ETH', name: 'Ethereum',      logo: '/images/eth.png', balance: '1.5',   decimals: 18 },
+  { chain: 'ethereum', symbol: 'USDC', name: 'USD Coin',     logo: 'https://cryptologos.cc/logos/usd-coin-usdc-logo.png', balance: '500',  address: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', decimals: 6  },
+  { chain: 'ethereum', symbol: 'WBTC', name: 'Wrapped Bitcoin', logo: 'https://cryptologos.cc/logos/wrapped-bitcoin-wbtc-logo.png', balance: '0.05', address: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599', decimals: 8  },
+  { chain: 'stellar',  symbol: 'XLM',  name: 'Stellar Lumens', logo: '/images/xlm.png', balance: '1000', decimals: 7  },
+  { chain: 'stellar',  symbol: 'yXLM', name: 'Yield XLM',    logo: '/images/xlm.png', balance: '500',  address: 'GDLQY5ZKDPZWVHWCFSYCBWFPXQTDLJDKTRAOWJGZGQW5KGZFJ3IJIPT', decimals: 7  },
+  { chain: 'stellar',  symbol: 'USDC', name: 'USD Coin',     logo: 'https://cryptologos.cc/logos/usd-coin-usdc-logo.png', balance: '250',  address: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5', decimals: 6  },
+  { chain: 'solana',   symbol: 'SOL',  name: 'Solana',       logo: '/images/sol.svg',  balance: '2.5',  decimals: 9  },
+];
+
+// Pre-normalise the full token list once at module load time. Each token gets a
+// stable canonicalId that uniquely identifies it across chains, preventing the
+// USDC-on-Ethereum / USDC-on-Stellar collision that would occur with symbol-only
+// comparisons.
+const NORMALISED_TOKENS: Array<NormalizedAsset & { balance?: string }> = RAW_TOKEN_LIST.map(
+  ({ balance, ...raw }) => ({ ...normalizeAsset(raw), balance }),
+);
 
 export default function TokenSelector({
   selectedToken,
   onSelectToken,
   chain = 'all',
-  label = 'Select Token'
+  label = 'Select Token',
 }: TokenSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [tokens, setTokens] = useState<Token[]>([]);
+  const [tokens, setTokens] = useState<Array<NormalizedAsset & { balance?: string }>>([]);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
-  // Örnek token listesi
+  // Filter the normalised token list by chain whenever the `chain` prop changes.
+  // Using canonicalIds as keys guarantees deterministic deduplication even when
+  // the same symbol appears on multiple chains.
   useEffect(() => {
-    // In real application, this data would come from API
-    const mockTokens: Token[] = [
-      {
-        symbol: 'ETH',
-        name: 'Ethereum',
-        logo: 'https://cryptologos.cc/logos/ethereum-eth-logo.png',
-        balance: '1.5',
-        chain: 'ethereum',
-        decimals: 18
-      },
-      {
-        symbol: 'USDC',
-        name: 'USD Coin',
-        logo: 'https://cryptologos.cc/logos/usd-coin-usdc-logo.png',
-        balance: '500',
-        chain: 'ethereum',
-        address: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
-        decimals: 6
-      },
-      {
-        symbol: 'WBTC',
-        name: 'Wrapped Bitcoin',
-        logo: 'https://cryptologos.cc/logos/wrapped-bitcoin-wbtc-logo.png',
-        balance: '0.05',
-        chain: 'ethereum',
-        address: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599',
-        decimals: 8
-      },
-      {
-        symbol: 'XLM',
-        name: 'Stellar Lumens',
-        logo: 'https://cryptologos.cc/logos/stellar-xlm-logo.png',
-        balance: '1000',
-        chain: 'stellar',
-        decimals: 7
-      },
-      {
-        symbol: 'yXLM',
-        name: 'Yield XLM',
-        logo: 'https://cryptologos.cc/logos/stellar-xlm-logo.png',
-        balance: '500',
-        chain: 'stellar',
-        address: 'yXLM-GDLQY5ZKDPZWVHWCFSYCBWFPXQTDLJDKTRAOWJGZGQW5KGZFJ3IJIPT',
-        decimals: 7
-      },
-      {
-        symbol: 'USDC',
-        name: 'USD Coin',
-        logo: 'https://cryptologos.cc/logos/usd-coin-usdc-logo.png',
-        balance: '250',
-        chain: 'stellar',
-        address: 'USDC-GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-        decimals: 6
-      }
-    ];
-
-    // Chain filtresi
-    if (chain !== 'all') {
-      const filteredTokens = mockTokens.filter(token => token.chain === chain);
-      setTokens(filteredTokens);
-    } else {
-      setTokens(mockTokens);
-    }
+    const filtered =
+      chain === 'all'
+        ? NORMALISED_TOKENS
+        : NORMALISED_TOKENS.filter((t) => t.chain === chain);
+    setTokens(filtered);
   }, [chain]);
 
-  // Dropdown dışına tıklandığında kapanma
+  // Collapse the dropdown when the user clicks outside.
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
       if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
         setIsOpen(false);
       }
     }
-
     document.addEventListener('mousedown', handleClickOutside);
-    return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
-    };
+    return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  // Filtrelenmiş tokenlar
-  const filteredTokens = tokens.filter(token => {
-    const query = searchQuery.toLowerCase();
+  // Filter by query against symbol, name, and address. The query is compared
+  // against the normalised symbol (upper-case) so "usdc" matches "USDC".
+  const filteredTokens = tokens.filter((token) => {
+    const q = searchQuery.toLowerCase();
     return (
-      token.symbol.toLowerCase().includes(query) ||
-      token.name.toLowerCase().includes(query) ||
-      token.address?.toLowerCase().includes(query)
+      token.symbol.toLowerCase().includes(q) ||
+      token.name.toLowerCase().includes(q) ||
+      token.address?.toLowerCase().includes(q)
     );
   });
 
-  // Token seçme
-  const handleSelectToken = (token: Token) => {
+  const handleSelectToken = (token: NormalizedAsset & { balance?: string }) => {
     onSelectToken(token);
     setIsOpen(false);
     setSearchQuery('');
+  };
+
+  const chainLabel = (c: SupportedChain): string => {
+    if (c === 'ethereum') return 'Ethereum';
+    if (c === 'stellar') return 'Stellar';
+    return 'Solana';
   };
 
   return (
@@ -132,8 +100,7 @@ export default function TokenSelector({
       <label className="block text-sm font-medium text-gray-300 mb-1">
         {label}
       </label>
-      
-      {/* Token Seçici Button */}
+
       <button
         type="button"
         onClick={() => setIsOpen(!isOpen)}
@@ -142,16 +109,12 @@ export default function TokenSelector({
         {selectedToken ? (
           <div className="flex items-center">
             {selectedToken.logo && (
-              <img 
-                src={selectedToken.logo} 
-                alt={selectedToken.symbol} 
-                className="w-6 h-6 mr-2 rounded-full"
-              />
+              <img src={selectedToken.logo} alt={selectedToken.symbol} className="w-6 h-6 mr-2 rounded-full" />
             )}
             <span>{selectedToken.symbol}</span>
-            {selectedToken.balance && (
+            {(selectedToken as NormalizedAsset & { balance?: string }).balance && (
               <span className="ml-2 text-sm text-gray-400">
-                ({selectedToken.balance})
+                ({(selectedToken as NormalizedAsset & { balance?: string }).balance})
               </span>
             )}
           </div>
@@ -162,11 +125,9 @@ export default function TokenSelector({
           <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
         </svg>
       </button>
-      
-      {/* Dropdown */}
+
       {isOpen && (
         <div className="absolute z-10 mt-1 w-full overflow-hidden rounded-xl border border-cyan-200/20 bg-[#070b1c]/95 shadow-2xl backdrop-blur-xl">
-          {/* Search */}
           <div className="p-3 border-b border-white/10">
             <input
               type="text"
@@ -177,41 +138,32 @@ export default function TokenSelector({
               autoFocus
             />
           </div>
-          
-          {/* Token List */}
+
           <div className="max-h-60 overflow-y-auto">
             {filteredTokens.length === 0 ? (
-              <div className="p-4 text-center text-gray-400">
-                No tokens found
-              </div>
+              <div className="p-4 text-center text-gray-400">No tokens found</div>
             ) : (
               filteredTokens.map((token) => (
                 <button
-                  key={`${token.chain}-${token.symbol}`}
+                  key={token.canonicalId}
                   type="button"
                   onClick={() => handleSelectToken(token)}
                   className="w-full px-4 py-3 flex items-center justify-between hover:bg-white/5 transition-colors border-b border-white/5 last:border-b-0"
                 >
                   <div className="flex items-center">
                     {token.logo && (
-                      <img 
-                        src={token.logo} 
-                        alt={token.symbol} 
-                        className="w-8 h-8 mr-3 rounded-full"
-                      />
+                      <img src={token.logo} alt={token.symbol} className="w-8 h-8 mr-3 rounded-full" />
                     )}
                     <div className="text-left">
                       <div className="font-medium text-white">{token.symbol}</div>
                       <div className="text-xs text-gray-400">{token.name}</div>
                     </div>
                   </div>
-                  
+
                   {token.balance && (
                     <div className="text-right">
                       <div className="text-sm text-white">{token.balance}</div>
-                      <div className="text-xs text-gray-400">
-                        {token.chain === 'ethereum' ? 'Ethereum' : 'Stellar'}
-                      </div>
+                      <div className="text-xs text-gray-400">{chainLabel(token.chain)}</div>
                     </div>
                   )}
                 </button>
@@ -222,4 +174,4 @@ export default function TokenSelector({
       )}
     </div>
   );
-} 
+}

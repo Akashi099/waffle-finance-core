@@ -203,18 +203,16 @@ fn each_transition_emits_exactly_one_mode_event() {
     env.mock_all_auths();
     let (_admin, htlc) = setup(&env);
 
-    let before_pause = env.events().all().len();
     htlc.set_mode(&ContractMode::Paused);
     assert_eq!(
-        env.events().all().len() - before_pause,
+        env.events().all().len(),
         1,
         "Live→Paused must emit exactly 1 event"
     );
 
-    let before_live = env.events().all().len();
     htlc.set_mode(&ContractMode::Live);
     assert_eq!(
-        env.events().all().len() - before_live,
+        env.events().all().len(),
         1,
         "Paused→Live must emit exactly 1 event"
     );

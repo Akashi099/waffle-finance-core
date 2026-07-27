@@ -2,9 +2,10 @@
 
 use super::*;
 use proptest::prelude::*;
-use soroban_sdk::testutils::{Address as _, Ledger};
+use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
 use soroban_sdk::{Address, Bytes, BytesN, Env};
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
+use std::vec::Vec;
 
 // Simple action set for sequences
 #[derive(Clone, Debug)]
@@ -45,7 +46,9 @@ proptest! {
             )
         };
 
-        let (admin, htlc_client) = setup(&env, 0);
+        let admin = Address::generate(&env);
+        let htlc_contract_id = env.register(HtlcContract, (admin.clone(), 0i128));
+        let htlc_client = HtlcContractClient::new(&env, &htlc_contract_id);
 
         // Keep track of accounts and initial balances
         let mut accounts: Vec<Address> = Vec::new();
@@ -70,7 +73,7 @@ proptest! {
                     let pre = Bytes::from_array(&env, &[42u8; 32]);
                     let hashlock = BytesN::<32>::from(env.crypto().sha256(&pre));
                     // attempt create_order, ignore panics
-                    let res = std::panic::catch_unwind(|| htlc_client.create_order(&sender, &beneficiary, &sender, &asset, &amount, &safety, &hashlock, &timelock));
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| htlc_client.create_order(&sender, &beneficiary, &sender, &asset, &amount, &safety, &hashlock, &timelock)));
                     match res {
                         Ok(id) => {
                             order_ids.push(Some(id));
@@ -87,7 +90,7 @@ proptest! {
                         if let Some(id) = id_opt {
                             let caller = accounts[(env.ledger().sequence() as usize + 2) % accounts.len()].clone();
                             let pre = if use_correct_preimage { preimages[order_idx].clone() } else { Bytes::from_array(&env, &[7u8; 32]) };
-                            let _ = std::panic::catch_unwind(|| htlc_client.claim_order(id, &pre, &caller));
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| htlc_client.claim_order(id, &pre, &caller)));
                         }
                     }
                 }
@@ -95,13 +98,13 @@ proptest! {
                     if let Some(id_opt) = order_ids.get(order_idx) {
                         if let Some(id) = id_opt {
                             let caller = accounts[(env.ledger().sequence() as usize + 3) % accounts.len()].clone();
-                            let _ = std::panic::catch_unwind(|| htlc_client.refund_order(id, &caller));
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| htlc_client.refund_order(id, &caller)));
                         }
                     }
                 }
                 Action::Advance { seconds } => {
                     let current = env.ledger().get();
-                    env.ledger().set(Ledger { timestamp: current.timestamp + seconds, protocol_version: current.protocol_version, sequence_number: current.sequence_number + 1, network_id: current.network_id, base_reserve: current.base_reserve, min_temp_entry_ttl: current.min_temp_entry_ttl, min_persistent_entry_ttl: current.min_persistent_entry_ttl, max_entry_ttl: current.max_entry_ttl });
+                    env.ledger().set(LedgerInfo { timestamp: current.timestamp + seconds, protocol_version: current.protocol_version, sequence_number: current.sequence_number + 1, network_id: current.network_id, base_reserve: current.base_reserve, min_temp_entry_ttl: current.min_temp_entry_ttl, min_persistent_entry_ttl: current.min_persistent_entry_ttl, max_entry_ttl: current.max_entry_ttl });
                 }
             }
         }
