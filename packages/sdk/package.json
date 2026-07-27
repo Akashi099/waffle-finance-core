@@ -39,6 +39,10 @@
       "import": "./dist/types/index.js",
       "types": "./dist/types/index.d.ts"
     },
+    "./routes": {
+      "import": "./dist/routes/index.js",
+      "types": "./dist/routes/index.d.ts"
+    },
     "./htlc-client": {
       "import": "./dist/htlc-client.js",
       "types": "./dist/htlc-client.d.ts"

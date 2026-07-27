@@ -30,11 +30,24 @@ exports so bundlers can tree-shake unused chains — see
 ## Supported bridge paths
 
 `Direction` (`@wafflefinance/sdk/types`) enumerates six chain pairings, but
-**the coordinator currently only accepts four of them**. `SUPPORTED_DIRECTIONS`
-(`@wafflefinance/sdk/coordinator`) is the single source of truth for what's
-actually live — check it (or `isDirectionLive` in
-[`examples/asset-resolution.ts`](./examples/asset-resolution.ts)) before
-assuming a direction works end-to-end.
+**the coordinator currently only accepts four of them**. The route registry
+(`@wafflefinance/sdk/routes`) is the single source of truth for what's actually
+live — resolve a route through it before assuming it works end-to-end:
+
+```typescript
+import { isSupportedRoute, listRoutesForNetwork } from '@wafflefinance/sdk/routes';
+
+isSupportedRoute({ direction: 'eth_to_xlm', tokenGroup: 'usdc', network: 'testnet' });
+listRoutesForNetwork('mainnet');   // every route usable on mainnet
+```
+
+A route is more than a direction: it is a direction, a token group, a bridge
+mode, and a quote model, serialised to a stable id like
+`eth_to_xlm:usdc:wafflefinance-htlc`. See
+[ROUTE_REGISTRY.md](./ROUTE_REGISTRY.md) for the full model, the rejection
+reasons, and how to add a route. `SUPPORTED_DIRECTIONS`
+(`@wafflefinance/sdk/coordinator`) still lists the live directions and is now
+re-exported from the registry.
 
 | Direction    | Live on coordinator? | Asset resolver (`@wafflefinance/sdk/assets`) |
 | ------------ | :-------------------: | --------------------------------------------- |
@@ -153,6 +166,7 @@ tested classifier that maps every error class above to a UI-facing category.
 | `@wafflefinance/sdk/secrets` | `generateSecret`, `hashSecret`, `verifyPreimage`. |
 | `@wafflefinance/sdk/state-machine` | SDK-local order transition guards (`canTransition`, `requireTransition`, `isTerminal`, `nextStatesOf`). |
 | `@wafflefinance/sdk/assets` | Asset resolution/normalisation/validation helpers — see [ASSET_MAPPING_CONTRACT.md](./ASSET_MAPPING_CONTRACT.md). |
+| `@wafflefinance/sdk/routes` | Route-identity registry: route validation, serialised route ids, per-network availability — see [ROUTE_REGISTRY.md](./ROUTE_REGISTRY.md). |
 | `@wafflefinance/sdk/ethereum`, `/ethereum/adapter` | `EthereumHTLCClient`, `EthereumHTLCAdapter`. |
 | `@wafflefinance/sdk/soroban`, `/soroban/adapter` | `SorobanHTLCClient`, `SorobanHTLCAdapter`, order-ref encode/decode. |
 | `@wafflefinance/sdk/solana`, `/solana/adapter` | `SolanaHTLCClient`, `SolanaHTLCAdapter`. |
@@ -198,6 +212,8 @@ npm run lint        # eslint src
 npm run build:analyze # build + bundle/tree-shaking sanity check
 ```
 
-See also [TREE_SHAKING.md](./TREE_SHAKING.md) (bundle optimisation) and
+See also [TREE_SHAKING.md](./TREE_SHAKING.md) (bundle optimisation),
 [ASSET_MAPPING_CONTRACT.md](./ASSET_MAPPING_CONTRACT.md) (canonical asset
-identifiers and per-network mapping tables).
+identifiers and per-network mapping tables), and
+[ROUTE_REGISTRY.md](./ROUTE_REGISTRY.md) (route identity, validation, and the
+lifecycle for adding a route).

@@ -186,6 +186,13 @@ import { gasPriceTracker } from './services/gas-tracker.js';
 import { getMonitor } from './services/monitoring.js';
 import { logSolanaStatus } from './utils/solana-config.js';
 import {
+  buildSupportPolicy,
+  decideOrderRoute,
+  logSupportPolicy,
+  supportSummary,
+} from './support.js';
+import { assertSupportPolicy, SupportPolicyValidationError } from '@wafflefinance/config';
+import {
   solanaPlaceholderMode,
   settlementVerificationTotal,
   settlementProofReplaysTotal,
@@ -461,6 +468,29 @@ async function initializeRelayer() {
   const solanaStatus = logSolanaStatus(solanaProgram);
   solanaPlaceholderMode.set(solanaStatus === 'placeholder' ? 1 : 0);
 
+  // ── Support policy ────────────────────────────────────────────────────────
+  //
+  // validateConfig() above proves the required env vars are present and not
+  // placeholders.  It does not establish that this deployment can carry a
+  // bridge leg end to end.  The policy states that explicitly, drives the route
+  // checks in POST /api/orders/create below, and is served from GET
+  // /api/support.  A relayer that cannot carry any route refuses to start
+  // rather than accepting orders it can never settle.
+  const supportPolicy = buildSupportPolicy(RELAYER_CONFIG, solanaProgram);
+  try {
+    assertSupportPolicy(supportPolicy);
+  } catch (err) {
+    if (err instanceof SupportPolicyValidationError) {
+      console.error('🚨 Relayer support policy is invalid — refusing to start:');
+      for (const problem of err.errors) {
+        console.error(`   [${problem.code}] ${problem.message}`);
+      }
+      process.exit(1);
+    }
+    throw err;
+  }
+  logSupportPolicy(supportPolicy);
+
   // Display configuration
   console.log(`≡ƒîÉ Environment: ${RELAYER_CONFIG.nodeEnv}`);
   console.log(`≡ƒöù Ethereum Network: ${RELAYER_CONFIG.ethereum.network}`);
@@ -710,6 +740,19 @@ async function initializeRelayer() {
     }
   });
 
+  // GET /api/support
+  //
+  // Publishes the relayer's declared capabilities: which chains and actions are
+  // available, which routes it will carry, and which chain pairs it will refuse
+  // together with the reason.  Operators and the frontend can read what the
+  // runtime actually supports instead of inferring it from a failed swap.
+  // Returns 503 when no route is available, so "running but useless" is visible
+  // to monitoring.
+  app.get('/api/support', (_req, res) => {
+    const summary = supportSummary(supportPolicy);
+    res.status(summary.actionable ? 200 : 503).json(summary);
+  });
+
   console.log('≡ƒôì DEBUG: Test endpoints registered (root + api)');
   console.log('≡ƒôì DEBUG: Now registering transaction history endpoint...');
 
@@ -801,6 +844,37 @@ async function initializeRelayer() {
           required: ['fromChain', 'toChain', 'fromToken', 'toToken', 'amount', 'ethAddress', 'stellarAddress']
         });
       }
+
+      // ── Route capability check ──────────────────────────────────────────
+      //
+      // Until now `fromChain` / `toChain` were required to be present and then
+      // ignored: the handler branched on `direction` alone, so a request naming
+      // an unsupported source chain was accepted and settled against Ethereum
+      // anyway.  The support policy is consulted here — before any escrow is
+      // encoded, any secret generated, or any order stored — so an unsupported
+      // chain, a contradictory chain/direction pair, or an asset class the
+      // relayer cannot move is refused while nothing is at stake.
+      const routeDecision = decideOrderRoute(supportPolicy, {
+        direction,
+        fromChain,
+        toChain,
+        fromToken,
+      });
+      if (!routeDecision.supported) {
+        console.warn(
+          `🚫 Order rejected [${routeDecision.code}]: ${routeDecision.reason}`
+        );
+        return res.status(400).json({
+          error: 'Unsupported route',
+          code: routeDecision.code,
+          details: routeDecision.reason,
+          supported: supportSummary(supportPolicy).routes.map((r) => r.id),
+        });
+      }
+      console.log(
+        `✅ Route ${routeDecision.from}→${routeDecision.to} ` +
+        `(${routeDecision.tokenClass}) is supported`
+      );
 
       console.log('≡ƒîë Creating bridge order:', {
         direction,
