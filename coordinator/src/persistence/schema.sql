@@ -68,6 +68,11 @@ CREATE INDEX IF NOT EXISTS idx_orders_created_at       ON orders (created_at DES
 CREATE INDEX IF NOT EXISTS idx_orders_src_address_created_at ON orders (src_address, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_dst_address_created_at ON orders (dst_address, created_at DESC);
 
+-- Cursor-based pagination indexes (see migrations/005_cursor_pagination.sql).
+CREATE INDEX IF NOT EXISTS idx_orders_cursor_pagination ON orders (created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_src_cursor ON orders (src_address, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_dst_cursor ON orders (dst_address, created_at DESC, id DESC);
+
 CREATE TABLE IF NOT EXISTS order_events (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id      INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,

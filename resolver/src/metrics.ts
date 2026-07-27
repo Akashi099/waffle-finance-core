@@ -53,13 +53,26 @@ export const activeListeners = new Gauge({
 
 export const registrationInfo = new Gauge({
   name: "resolver_registration_info",
-  help: "Resolver registration status (1 = registered, 0 = not registered)",
+  help: "Resolver registration status per chain (1 = active, 0 = not active)",
+  labelNames: ["chain"] as const,
+  registers: [registry],
+});
+
+/**
+ * Enum-style gauge: exactly one (chain, state) series is 1 at a time, all
+ * other states for that chain are 0. See registry-status.ts for the state
+ * model (unregistered / active / low_stake / slashed / unbonding / inactive).
+ */
+export const resolverLifecycleState = new Gauge({
+  name: "resolver_registry_lifecycle_state",
+  help: "Resolver registry lifecycle state per chain (1 = current state, 0 = other states)",
+  labelNames: ["chain", "state"] as const,
   registers: [registry],
 });
 
 export const registrationChangesTotal = new Counter({
   name: "resolver_registration_changes_total",
-  help: "Total registration state changes (register, unregister, slash)",
+  help: "Total registry lifecycle state transitions, labeled by the state entered (unregistered, active, low_stake, slashed, unbonding, inactive)",
   labelNames: ["action"] as const,
   registers: [registry],
 });
@@ -139,6 +152,7 @@ export const resolverMetrics = {
   listenerLastEventTimestampSeconds,
   activeListeners,
   registrationInfo,
+  resolverLifecycleState,
   registrationChangesTotal,
   startTimeSeconds,
   ordersProcessedTotal,

@@ -14,8 +14,8 @@
  * ─────────────────────────────────────
  * LOCAL (this file):
  *   - Hashlock format (0x + 64 hex chars)
- *   - direction is one of the four coordinator-supported values
- *   - srcChain/dstChain alignment with direction
+ *   - direction is live according to the route registry (`routes/index.ts`)
+ *   - srcChain/dstChain alignment with direction, per the registry
  *   - Address format per chain (ETH 0x40, Stellar G+55, Solana base58 32-44)
  *   - Ethereum zero-address rejection
  *   - srcAmount, srcSafetyDeposit, dstAmount are decimal integer strings
@@ -29,6 +29,12 @@
  */
 
 import type { Chain } from "../types/index.js";
+import {
+  LIVE_DIRECTION_CHAINS,
+  LIVE_ROUTE_DIRECTIONS,
+  SUPPORTED_CHAINS,
+  isLiveDirection,
+} from "../routes/index.js";
 import type { CoordinatorDirection, CoordinatorAnnounceRequest } from "./contract.js";
 import { CoordinatorValidationError } from "./errors.js";
 
@@ -41,26 +47,23 @@ const SOLANA_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const DECIMAL_INT = /^\d+$/;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
-// ── Direction → chain mapping (mirrors coordinator/src/validation/announce.ts) ─
+// ── Direction → chain mapping (from the route registry) ──────────────────────
 
 /**
  * The src/dst chains each coordinator-supported direction must use.
- * Kept in sync with coordinator `DIRECTION_CHAINS`.
+ *
+ * Re-exported from the route registry (`routes/index.ts`), which is the single
+ * source of truth for route identity. Kept as a named export here for the
+ * consumers that already import it from `@wafflefinance/sdk`.
  */
-export const DIRECTION_CHAINS: Record<CoordinatorDirection, { src: Chain; dst: Chain }> = {
-  eth_to_xlm: { src: "ethereum", dst: "stellar" },
-  xlm_to_eth: { src: "stellar", dst: "ethereum" },
-  eth_to_sol: { src: "ethereum", dst: "solana" },
-  sol_to_eth: { src: "solana", dst: "ethereum" },
-};
+export const DIRECTION_CHAINS: Record<CoordinatorDirection, { src: Chain; dst: Chain }> =
+  LIVE_DIRECTION_CHAINS;
 
-/** All four directions the coordinator currently supports. */
-export const SUPPORTED_DIRECTIONS: ReadonlyArray<CoordinatorDirection> = [
-  "eth_to_xlm",
-  "xlm_to_eth",
-  "eth_to_sol",
-  "sol_to_eth",
-];
+/**
+ * All four directions the coordinator currently supports.
+ * Re-exported from the route registry — see {@link DIRECTION_CHAINS}.
+ */
+export const SUPPORTED_DIRECTIONS: ReadonlyArray<CoordinatorDirection> = LIVE_ROUTE_DIRECTIONS;
 
 // ── Individual field validators ─────────────────────────────────────────────
 
@@ -134,11 +137,11 @@ export function validateAnnounceRequest(input: unknown): ValidationResult {
 
   const req = input as Record<string, unknown>;
 
-  // direction
+  // direction — the registry decides which directions are live
   const direction = req["direction"];
   if (typeof direction !== "string") {
     issues.push({ field: "direction", message: "direction is required" });
-  } else if (!(SUPPORTED_DIRECTIONS as string[]).includes(direction)) {
+  } else if (!isLiveDirection(direction)) {
     issues.push({
       field: "direction",
       message: `direction must be one of: ${SUPPORTED_DIRECTIONS.join(", ")} (got "${direction}")`,
@@ -154,10 +157,10 @@ export function validateAnnounceRequest(input: unknown): ValidationResult {
     if (err) issues.push({ field: "hashlock", message: err });
   }
 
-  // srcChain / dstChain
+  // srcChain / dstChain — chain vocabulary comes from the registry
   const srcChain = req["srcChain"];
   const dstChain = req["dstChain"];
-  const validChains = ["ethereum", "stellar", "solana"];
+  const validChains: string[] = [...SUPPORTED_CHAINS];
 
   if (typeof srcChain !== "string" || !validChains.includes(srcChain)) {
     issues.push({ field: "srcChain", message: `srcChain must be one of: ${validChains.join(", ")}` });
@@ -169,13 +172,13 @@ export function validateAnnounceRequest(input: unknown): ValidationResult {
   // direction/chain alignment (only when all three fields are valid strings)
   if (
     typeof direction === "string" &&
-    (SUPPORTED_DIRECTIONS as string[]).includes(direction) &&
+    isLiveDirection(direction) &&
     typeof srcChain === "string" &&
     validChains.includes(srcChain) &&
     typeof dstChain === "string" &&
     validChains.includes(dstChain)
   ) {
-    const want = DIRECTION_CHAINS[direction as CoordinatorDirection];
+    const want = LIVE_DIRECTION_CHAINS[direction];
     if (srcChain !== want.src) {
       issues.push({
         field: "srcChain",

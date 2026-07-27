@@ -17,10 +17,16 @@ possible (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE … ADD COLUMN IF NOT EXIST
 | `002_solana_support.sql`      | Adds `solana` to chain CHECK constraints                     |
 | `003_secret_encryption.sql`   | Adds `preimage_enc_version` to `orders`                      |
 | `004_query_optimizations.sql` | Adds composite indexes for history lookups                   |
+| `005_cursor_pagination.sql`   | Adds cursor-pagination composite indexes on `(created_at, id)` |
 | `005_schema_migrations.sql`   | Creates the `schema_migrations` tracking table               |
-| `006_stale_cleanup.sql`       | Adds `archived_at` to `orders`                               |
+| `006_stale_cleanup.sql`       | Adds `archived_at` to `orders`                                |
+| `007_audit_log.sql`           | Creates the append-only `audit_log` table                    |
 
 PostgreSQL uses parallel files where SQL syntax differs (e.g. `002_solana_support_postgres.sql`).
+
+See [`schema-contract.md`](./schema-contract.md) for the canonical per-table
+field/index/constraint contract and the policy on additive changes, backfills,
+and soft-deletes.
 
 ### Version tracking
 

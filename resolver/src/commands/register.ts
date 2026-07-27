@@ -4,17 +4,44 @@ import {
   http,
   parseAbi,
   parseUnits,
-  type Address
+  type Address,
+  type Chain
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { sepolia, mainnet } from "viem/chains";
+import { supportsAction } from "@wafflefinance/config";
 import { loadConfig } from "../config.js";
 import { getLogger } from "../logger.js";
 import { retryRpcCall } from "../retry.js";
 import { runResolverCommand } from "../command-runner.js";
+import { buildSupportPolicy } from "../support.js";
 import { registrationInfo, registrationChangesTotal } from "../metrics.js";
 
 const CHAIN_ETH = "ethereum";
+
+/**
+ * Ethereum chain ids the registry commands can operate on.
+ *
+ * Replaces a `chainId === 1 ? mainnet : sepolia` fallback, under which *any*
+ * unrecognised chain id was silently treated as Sepolia — a resolver pointed at
+ * an unsupported network would have signed transactions using the wrong chain
+ * definition.  An unknown id is now a hard failure.
+ */
+const EVM_CHAINS: Readonly<Record<number, Chain>> = {
+  [mainnet.id]: mainnet,
+  [sepolia.id]: sepolia,
+};
+
+function resolveEvmChain(chainId: number): Chain {
+  const chain = EVM_CHAINS[chainId];
+  if (!chain) {
+    throw new Error(
+      `Ethereum chain id ${chainId} is not supported for registry actions ` +
+        `(supported: ${Object.keys(EVM_CHAINS).join(", ")})`
+    );
+  }
+  return chain;
+}
 
 const REGISTRY_ABI = parseAbi([
   "function register(uint256 stake)",
@@ -41,6 +68,17 @@ function ensureEvmContext() {
   const cfg = loadConfig();
   const log = getLogger(cfg.logLevel);
 
+  // Registry staking is gated on the support policy rather than on local null
+  // checks, so the CLI refuses for the same reason — and with the same wording —
+  // that `/support` and the startup log report.
+  const policy = buildSupportPolicy(cfg);
+  const canRegister = supportsAction(policy, "ethereum", "register");
+  if (!canRegister.supported) {
+    throw new Error(`resolver cannot register: ${canRegister.reason}`);
+  }
+
+  // Narrowing for the type checker.  The policy check above already guarantees
+  // both values are present; these throws are unreachable in practice.
   if (!cfg.ethereum.resolverRegistry) {
     throw new Error("ETH_RESOLVER_REGISTRY contract address is not configured");
   }
@@ -48,7 +86,7 @@ function ensureEvmContext() {
     throw new Error("RESOLVER_ETH_PRIVATE_KEY env var is required for registry actions");
   }
 
-  const chain = cfg.ethereum.chainId === 1 ? mainnet : sepolia;
+  const chain = resolveEvmChain(cfg.ethereum.chainId);
   const account = privateKeyToAccount(cfg.ethereum.resolverPrivateKey);
   const publicClient = createPublicClient({ chain, transport: http(cfg.ethereum.rpcUrl) });
   const walletClient = createWalletClient({ chain, account, transport: http(cfg.ethereum.rpcUrl) });

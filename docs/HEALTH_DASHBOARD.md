@@ -33,3 +33,8 @@ readiness degraded.
 The dashboard treats unreachable services as `unhealthy`, live services with
 failing readiness as `degraded`, and `status: "ok"` from service endpoints as
 `healthy`.
+
+For how each service's readiness signal is proven honest under actual RPC
+failure conditions (delayed responses, dropped connections, partial
+receipts), see
+[`docs/RPC_DEGRADATION_TEST_MATRIX.md`](./RPC_DEGRADATION_TEST_MATRIX.md).
