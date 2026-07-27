@@ -1,6 +1,7 @@
 import type { Database } from "./db.js";
 import { canTransition, isTerminal } from "../state-machine/order-machine.js";
 import { dbQueryDuration } from "../metrics.js";
+import { InMemoryRepositoryTransaction, type RepositoryTransaction } from "./transaction-contract.js";
 
 type DatabaseT = Database;
 type Statement = ReturnType<DatabaseT["prepare"]>;
@@ -155,6 +156,7 @@ function rowToOrder(r: OrderDbRow): OrderRow {
 }
 
 export class OrdersRepository {
+  private readonly transactionManager: RepositoryTransaction;
   private readonly insertStmt: Statement;
   private readonly byPublicId: Statement;
   private readonly byHashlock: Statement;
@@ -169,7 +171,8 @@ export class OrdersRepository {
   private readonly rollbackSrc: Statement;
   private readonly rollbackDst: Statement;
 
-  constructor(private readonly db: DatabaseT) {
+  constructor(private readonly db: DatabaseT, transactionManager?: RepositoryTransaction) {
+    this.transactionManager = transactionManager ?? new InMemoryRepositoryTransaction();
     this.insertStmt = db.prepare(`
       INSERT INTO orders (
         public_id, direction, status, hashlock,
@@ -433,7 +436,9 @@ export class OrdersRepository {
   }
 
   async setStatus(publicId: string, status: OrderStatus): Promise<void> {
-    await this.run(this.updateStatus, { publicId, status });
+    await this.transactionManager.runWithRetry("status-update", async () => {
+      await this.run(this.updateStatus, { publicId, status });
+    });
   }
 
   /**
@@ -456,15 +461,17 @@ export class OrdersRepository {
     blockNumber: number;
     timelock: number;
   }): Promise<void> {
-    const order = await this.get<OrderDbRow>(this.byPublicId, input.publicId);
-    if (!order) return;
-    // Repeated lock events on a terminal order are a no-op: a completed,
-    // refunded or failed order must never be dragged back into src_locked
-    // under event replay. (`expired` is non-terminal: it falls through to
-    // nextLockStatus, which keeps it expired since the transition is invalid.)
-    if (isTerminal(order.status)) return;
-    const status = this.nextLockStatus(order.status, "src_locked");
-    await this.run(this.updateSrcLock, { ...input, status });
+    await this.transactionManager.runWithRetry("src-lock-update", async () => {
+      const order = await this.get<OrderDbRow>(this.byPublicId, input.publicId);
+      if (!order) return;
+      // Repeated lock events on a terminal order are a no-op: a completed,
+      // refunded or failed order must never be dragged back into src_locked
+      // under event replay. (`expired` is non-terminal: it falls through to
+      // nextLockStatus, which keeps it expired since the transition is invalid.)
+      if (isTerminal(order.status)) return;
+      const status = this.nextLockStatus(order.status, "src_locked");
+      await this.run(this.updateSrcLock, { ...input, status });
+    });
   }
 
   async recordDstLock(input: {
@@ -475,15 +482,17 @@ export class OrdersRepository {
     timelock: number;
     resolver: string | null;
   }): Promise<void> {
-    const order = await this.get<OrderDbRow>(this.byPublicId, input.publicId);
-    if (!order) return;
-    // Idempotent no-op for terminal orders: a repeated recordDstLock must
-    // not move a completed/refunded/failed order into dst_locked. (`expired`
-    // is non-terminal but still can't transition to dst_locked, so
-    // nextLockStatus keeps it expired.)
-    if (isTerminal(order.status)) return;
-    const status = this.nextLockStatus(order.status, "dst_locked");
-    await this.run(this.updateDstLock, { ...input, status });
+    await this.transactionManager.runWithRetry("dst-lock-update", async () => {
+      const order = await this.get<OrderDbRow>(this.byPublicId, input.publicId);
+      if (!order) return;
+      // Idempotent no-op for terminal orders: a repeated recordDstLock must
+      // not move a completed/refunded/failed order into dst_locked. (`expired`
+      // is non-terminal but still can't transition to dst_locked, so
+      // nextLockStatus keeps it expired.)
+      if (isTerminal(order.status)) return;
+      const status = this.nextLockStatus(order.status, "dst_locked");
+      await this.run(this.updateDstLock, { ...input, status });
+    });
   }
 
   async recordSecretRevealed(input: {
@@ -492,11 +501,13 @@ export class OrdersRepository {
     txHash: string;
     encVersion?: number | null;
   }): Promise<void> {
-    await this.run(this.updateSecret, {
-      publicId: input.publicId,
-      preimage: input.preimage,
-      txHash: input.txHash,
-      encVersion: input.encVersion ?? null
+    await this.transactionManager.runWithRetry("secret-update", async () => {
+      await this.run(this.updateSecret, {
+        publicId: input.publicId,
+        preimage: input.preimage,
+        txHash: input.txHash,
+        encVersion: input.encVersion ?? null
+      });
     });
   }
 

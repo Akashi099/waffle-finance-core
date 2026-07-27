@@ -35,6 +35,14 @@
 
 import type { Chain, Direction, ExternalBridgeKind } from "../types/index.js";
 import {
+  estimateRouteFee,
+  getRouteFeePolicy,
+  ROUTE_FEE_POLICIES,
+  type RouteFeeEstimate,
+  type RouteFeeFixture,
+  type RouteFeePolicy,
+} from "./fee-policy.js";
+import {
   NATIVE_ETH_ADDRESS,
   NATIVE_SOL_MINT,
   isSupportedEthToSolana,
