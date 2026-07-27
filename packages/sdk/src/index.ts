@@ -48,6 +48,9 @@ export {
   tokenGroupForAsset,
   routeIdForOrder,
   sameRoute,
+  estimateRouteFee,
+  getRouteFeePolicy,
+  ROUTE_FEE_POLICIES,
 } from "./routes/index.js";
 export type {
   LiveRouteDirection,
@@ -62,6 +65,9 @@ export type {
   RouteFilter,
   RouteIdentitySource,
   UnknownRouteReason,
+  RouteFeeEstimate,
+  RouteFeeFixture,
+  RouteFeePolicy,
 } from "./routes/index.js";
 
 // Shared HTLC interface + error types

@@ -21,6 +21,7 @@ import { solanaPlaceholderMode } from "./metrics.js";
 import type { CoordinatorConfig } from "./config.js";
 import { AuditRepository } from "./audit/audit-repo.js";
 import { buildSystemAuditEntry } from "./audit/audit-log.js";
+import { PressureController } from "./services/pressure-controller.js";
 
 // ── Startup dependency probes ────────────────────────────────────────────────
 
@@ -238,6 +239,7 @@ async function main(): Promise<void> {
   // Central dispatcher that enforces the deterministic priority contract:
   //   LIVE_EVENT > REPLAY_JOB > SECRET_RECOVERY > STALE_CLEANUP
   const backlog = new BacklogScheduler(log);
+  const pressureController = new PressureController();
 
   // Defined before createApp so the reference is valid when injected.
   const runExpiryScan = async (): Promise<{ expiredCount: number }> => {
@@ -288,8 +290,19 @@ async function main(): Promise<void> {
   // same time.  The scheduler drains its queue on each tick in strict order:
   //   LIVE_EVENT > REPLAY_JOB > SECRET_RECOVERY > STALE_CLEANUP
 
+  const applyPressurePolicy = () => {
+    const pressure = backlog.getTotalDepth();
+    pressureController.observe({
+      kind: "reconciliation",
+      queueDepth: pressure,
+      lag: Math.max(0, (cfg.pollIntervalMs ?? 15000) - 15000),
+      failureRate: 0.05,
+    });
+  };
+
   // First reconciliation: enqueue as a REPLAY_JOB so it runs before any
   // stale-cleanup work but yields to any live events the listeners enqueue.
+  applyPressurePolicy();
   void backlog.enqueue({
     name: "reconciler:startup",
     priority: Priority.REPLAY_JOB,
@@ -305,6 +318,7 @@ async function main(): Promise<void> {
 
   // Periodic reconciliation: every pollIntervalMs × 4 (default ~60 s)
   const reconcileInterval = setInterval(() => {
+    applyPressurePolicy();
     backlog.enqueue({
       name: "reconciler:periodic",
       priority: Priority.REPLAY_JOB,
@@ -315,6 +329,7 @@ async function main(): Promise<void> {
 
   // Expiry scan: every pollIntervalMs × 4 (default ~60 s)
   const runExpiry = (): void => {
+    applyPressurePolicy();
     backlog.enqueue({
       name: "expiry-scan",
       priority: Priority.REPLAY_JOB,
@@ -332,6 +347,7 @@ async function main(): Promise<void> {
   // Routed as STALE_CLEANUP — lowest priority.  Both old StaleCleanupService
   // and the new ArchivalPolicy run here so the metrics for each are preserved.
   const runStaleCleanup = (): void => {
+    applyPressurePolicy();
     backlog.enqueue({
       name: "stale-cleanup",
       priority: Priority.STALE_CLEANUP,
@@ -372,7 +388,7 @@ async function main(): Promise<void> {
   // from "fully ready".
   startupPhase = "pending";
 
-  log.info("coordinator fully started — all listeners active");
+  log.info({ mode: pressureController.getMode(), limits: pressureController.getLimits() }, "coordinator fully started — all listeners active");
 
   // ── 8. Graceful shutdown ────────────────────────────────────────────────
   const shutdown = async (signal: string) => {
