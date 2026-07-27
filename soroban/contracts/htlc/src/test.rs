@@ -2031,3 +2031,323 @@ fn create_order_auth_tree_covers_token_transfer_sub_invocation() {
     env.mock_all_auths();
     assert!(htlc.get_order(&order_id).is_some());
 }
+
+// =====================================================================
+// ASSET CLASS MODEL — native XLM vs SAC token, order version field
+// =====================================================================
+
+#[test]
+fn native_xlm_order_create_and_claim_succeeds() {
+    // Register the SAC token as the "native XLM" address via set_native_token,
+    // then verify the order is classified AssetClass::Native and that
+    // the full create → claim flow works correctly.
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (native_asset, sac, token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    // Mark this token as the native XLM contract.
+    htlc.set_native_token(&native_asset);
+    assert_eq!(htlc.native_token(), Some(native_asset.clone()));
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let caller = Address::generate(&env);
+    sac.mint(&sender, &500_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0xaau8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let amount = 100_0000000i128;
+    let safety = 5_000_000i128;
+
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &native_asset,
+        &amount, &safety, &hashlock, &600u64,
+    );
+
+    let order: Order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.asset_class, crate::AssetClass::Native);
+    assert_eq!(order.version, 1);
+    assert_eq!(token.balance(&htlc.address), amount + safety);
+
+    htlc.claim_order(&order_id, &preimage, &caller);
+    assert_eq!(token.balance(&beneficiary), amount);
+    assert_eq!(token.balance(&caller), safety);
+    assert_eq!(token.balance(&htlc.address), 0);
+    assert_eq!(htlc.get_order(&order_id).unwrap().status, OrderStatus::Claimed);
+}
+
+#[test]
+fn native_xlm_order_create_and_refund_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (native_asset, sac, token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    htlc.set_native_token(&native_asset);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let refund_to = Address::generate(&env);
+    let caller = Address::generate(&env);
+    sac.mint(&sender, &200_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0xbbu8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let amount = 80_0000000i128;
+    let safety = 2_000_000i128;
+
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &refund_to, &native_asset,
+        &amount, &safety, &hashlock, &600u64,
+    );
+
+    let order: Order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.asset_class, crate::AssetClass::Native);
+
+    advance_ledger(&env, 601);
+    htlc.refund_order(&order_id, &caller);
+
+    assert_eq!(token.balance(&refund_to), amount);
+    assert_eq!(token.balance(&caller), safety);
+    assert_eq!(token.balance(&htlc.address), 0);
+    assert_eq!(htlc.get_order(&order_id).unwrap().status, OrderStatus::Refunded);
+}
+
+#[test]
+fn sac_token_order_asset_class_is_token() {
+    // An asset address that is not registered as native is classified Token.
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    // Do NOT call set_native_token — asset stays Token-class.
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let caller = Address::generate(&env);
+    sac.mint(&sender, &200_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0xccu8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let amount = 50_0000000i128;
+
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &amount, &0i128, &hashlock, &600u64,
+    );
+
+    let order: Order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.asset_class, crate::AssetClass::Token);
+    assert_eq!(order.version, 1);
+
+    htlc.claim_order(&order_id, &preimage, &caller);
+    assert_eq!(token.balance(&beneficiary), amount);
+    assert_eq!(token.balance(&htlc.address), 0);
+}
+
+#[test]
+fn clear_native_token_reclassifies_subsequent_orders_as_token() {
+    // After clear_native_token, the same asset address no longer maps to Native.
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    htlc.set_native_token(&asset);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &400_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0xddu8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+
+    // First order: Native.
+    let id1 = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &50_0000000i128, &0i128, &hashlock, &600u64,
+    );
+    assert_eq!(htlc.get_order(&id1).unwrap().asset_class, crate::AssetClass::Native);
+
+    // Clear the native token binding.
+    htlc.clear_native_token();
+    assert_eq!(htlc.native_token(), None);
+
+    // Second order with same asset: now Token.
+    let id2 = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &50_0000000i128, &0i128, &hashlock, &600u64,
+    );
+    assert_eq!(htlc.get_order(&id2).unwrap().asset_class, crate::AssetClass::Token);
+}
+
+// =====================================================================
+// INVALID ASSET — rejected before any transfer
+// =====================================================================
+
+#[test]
+fn create_order_with_htlc_itself_as_asset_rejected() {
+    // Passing the HTLC contract's own address as the token would route
+    // the transfer to itself; this is explicitly rejected before any
+    // transfer occurs.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let hashlock = sha256_32(&env, &Bytes::from_array(&env, &[0xeeu8; 32]));
+
+    let res = htlc.try_create_order(
+        &sender, &beneficiary, &sender,
+        &htlc.address,   // ← the HTLC contract itself as asset
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+    assert_eq!(
+        res.err().unwrap().unwrap(),
+        Error::InvalidAsset.into(),
+        "HTLC must reject its own address as the asset"
+    );
+}
+
+// =====================================================================
+// OVERFLOW — amount + safety_deposit overflows i128
+// =====================================================================
+
+#[test]
+fn create_order_overflow_total_rejected() {
+    // i128::MAX + 1 overflows. The overflow check fires before any
+    // transfer so no tokens need to be held by the sender.
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, _sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let hashlock = sha256_32(&env, &Bytes::from_array(&env, &[0xffu8; 32]));
+
+    let res = htlc.try_create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &i128::MAX, &1i128, &hashlock, &600u64,
+    );
+    assert_eq!(
+        res.err().unwrap().unwrap(),
+        Error::Overflow.into(),
+        "amount + safety_deposit overflow must be caught before transfer"
+    );
+}
+
+// =====================================================================
+// POST-FINALIZATION IDEMPOTENCY — terminal orders cannot be re-entered
+// =====================================================================
+
+#[test]
+fn double_refund_after_refund_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let caller = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x11u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    advance_ledger(&env, 601);
+    htlc.refund_order(&order_id, &caller);
+    assert_eq!(htlc.get_order(&order_id).unwrap().status, OrderStatus::Refunded);
+
+    // Second refund on a terminal (Refunded) order must fail.
+    let res = htlc.try_refund_order(&order_id, &caller);
+    assert_eq!(
+        res.err().unwrap().unwrap(),
+        Error::OrderNotRefundable.into(),
+        "double-refund on a Refunded order must be rejected"
+    );
+}
+
+#[test]
+fn claim_after_refund_fails() {
+    // An order that has been refunded is terminal; a subsequent claim
+    // attempt must be rejected with OrderNotClaimable, not with an
+    // incorrect preimage error.
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let caller = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x22u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    advance_ledger(&env, 601);
+    htlc.refund_order(&order_id, &caller);
+
+    // Even with the correct preimage, claim must be rejected.
+    let res = htlc.try_claim_order(&order_id, &preimage, &beneficiary);
+    assert_eq!(
+        res.err().unwrap().unwrap(),
+        Error::OrderNotClaimable.into(),
+        "claim after refund must be rejected as not claimable"
+    );
+}
+
+#[test]
+fn refund_after_claim_is_rejected_as_not_refundable() {
+    // Mirror of claim_after_refund: once claimed, any refund is rejected.
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x33u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    htlc.claim_order(&order_id, &preimage, &beneficiary);
+
+    // Advance past timelock; the order is still Claimed.
+    advance_ledger(&env, 601);
+    let res = htlc.try_refund_order(&order_id, &beneficiary);
+    assert_eq!(
+        res.err().unwrap().unwrap(),
+        Error::OrderNotRefundable.into(),
+        "refund after claim must be rejected"
+    );
+}
