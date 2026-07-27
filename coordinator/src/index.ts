@@ -27,6 +27,7 @@ import {
 import type { CoordinatorConfig } from "./config.js";
 import { AuditRepository } from "./audit/audit-repo.js";
 import { buildSystemAuditEntry } from "./audit/audit-log.js";
+import { PressureController } from "./services/pressure-controller.js";
 
 // ── Startup dependency probes ────────────────────────────────────────────────
 
@@ -221,6 +222,7 @@ async function main(): Promise<void> {
   // ── Backlog scheduler ────────────────────────────────────────────────────
   // Central dispatcher enforcing:  LIVE_EVENT > REPLAY_JOB > SECRET_RECOVERY > STALE_CLEANUP
   const backlog = new BacklogScheduler(log);
+  const pressureController = new PressureController();
 
   // ── Maintenance scheduler ────────────────────────────────────────────────
   //
@@ -324,8 +326,19 @@ async function main(): Promise<void> {
   // Expiry, stale-cleanup and archival-policy are all driven by
   // MaintenanceScheduler.start() below — no more raw setIntervals for those.
 
+  const applyPressurePolicy = () => {
+    const pressure = backlog.getTotalDepth();
+    pressureController.observe({
+      kind: "reconciliation",
+      queueDepth: pressure,
+      lag: Math.max(0, (cfg.pollIntervalMs ?? 15000) - 15000),
+      failureRate: 0.05,
+    });
+  };
+
   // First reconciliation: enqueue as a REPLAY_JOB so it runs before any
-  // stale-cleanup work but yields to live events from listeners.
+  // stale-cleanup work but yields to any live events the listeners enqueue.
+  applyPressurePolicy();
   void backlog.enqueue({
     name: "reconciler:startup",
     priority: Priority.REPLAY_JOB,
@@ -341,6 +354,7 @@ async function main(): Promise<void> {
 
   // Periodic reconciliation: every pollIntervalMs × 4 (default ~60 s)
   const reconcileInterval = setInterval(() => {
+    applyPressurePolicy();
     backlog.enqueue({
       name: "reconciler:periodic",
       priority: Priority.REPLAY_JOB,
@@ -349,9 +363,45 @@ async function main(): Promise<void> {
     void backlog.run();
   }, cfg.pollIntervalMs * 4);
 
-  // Cache verification runs every ~60 reconciliation cycles (~1 hour).
-  // Read-only and low-cost, so it stays on its own interval outside the
-  // maintenance scheduler (no funds at risk, no DB writes).
+  // Expiry scan: every pollIntervalMs × 4 (default ~60 s)
+  const runExpiry = (): void => {
+    applyPressurePolicy();
+    backlog.enqueue({
+      name: "expiry-scan",
+      priority: Priority.REPLAY_JOB,
+      execute: async () => {
+        const n = await orders.expireStaleOrders();
+        if (n > 0) log.info({ count: n }, "expired stale orders by timelock");
+      },
+    });
+    void backlog.run();
+  };
+  void runExpiry();
+  const expiryInterval = setInterval(runExpiry, cfg.pollIntervalMs * 4);
+
+  // Stale-order archival: every pollIntervalMs × 240 (default ~60 min)
+  // Routed as STALE_CLEANUP — lowest priority.  Both old StaleCleanupService
+  // and the new ArchivalPolicy run here so the metrics for each are preserved.
+  const runStaleCleanup = (): void => {
+    applyPressurePolicy();
+    backlog.enqueue({
+      name: "stale-cleanup",
+      priority: Priority.STALE_CLEANUP,
+      execute: () => staleCleanup.run().then(() => undefined),
+    });
+    backlog.enqueue({
+      name: "archival-policy",
+      priority: Priority.STALE_CLEANUP,
+      execute: () => archivalPolicy.runArchival().then(() => undefined),
+    });
+    void backlog.run();
+  };
+  const staleCleanupInterval = setInterval(runStaleCleanup, cfg.pollIntervalMs * 240);
+
+  // Cache verification runs every ~60 reconciliation cycles (roughly once per
+  // hour at the default 15 s poll interval × 4 multiplier).  It is read-only
+  // and low-cost — it only samples 50 active orders — so running it more
+  // frequently than hourly would provide no additional safety margin.
   const runCacheVerify = (): void => {
     cacheVerifier.run().catch((err) => log.warn({ err }, "cache verification failed"));
   };
@@ -379,10 +429,7 @@ async function main(): Promise<void> {
   // from "fully ready".
   startupPhase = "pending";
 
-  log.info(
-    { maintenanceJobs: maintenance.getStatus().map((j) => j.name) },
-    "coordinator fully started — all listeners and maintenance jobs active"
-  );
+  log.info({ mode: pressureController.getMode(), limits: pressureController.getLimits() }, "coordinator fully started — all listeners active");
 
   // ── 8. Graceful shutdown ────────────────────────────────────────────────
   const shutdown = async (signal: string) => {

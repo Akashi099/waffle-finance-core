@@ -15,7 +15,8 @@ import {
   reconciliationRuns,
   reconciliationErrors,
   reconciliationLastRun,
-  reconciliationEventsReplayed
+  reconciliationEventsReplayed,
+  sorobanDecodeErrors,
 } from "../metrics.js";
 import { validatePreimage } from "./secret-reconciler.js";
 import {
@@ -32,6 +33,13 @@ const ORDER_CLAIMED = parseAbiItem(
 const ORDER_REFUNDED = parseAbiItem(
   "event OrderRefunded(uint256 indexed orderId, address indexed caller, uint256 amount, uint256 safetyDeposit)"
 );
+
+interface SorobanRpcEvent {
+  ledger: number;
+  txHash: string;
+  topic?: xdr.ScVal[];
+  value: xdr.ScVal;
+}
 
 /** How many Ethereum blocks ~48h covers at ~12s/block (increased from 24h for better recovery) */
 const ETH_LOOKBACK_BLOCKS = 14_400n;
@@ -279,6 +287,7 @@ export class Reconciler {
 
     // Malformed payload: log as operational failure, never mutate order state.
     if (isMalformedEvent(result)) {
+      sorobanDecodeErrors.inc({ reason: result.reason });
       this.log.warn(
         {
           ledger: ev.ledger,

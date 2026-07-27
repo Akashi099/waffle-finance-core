@@ -212,9 +212,12 @@ export function decodeHtlcEvent(
       return malformed(eventKind, "data_count_mismatch",
         `expected ≥5 data elements, got ${data.length}`);
     }
-    const [orderId, , amount, safetyDeposit, timelock] = data as unknown[];
+    const [orderId, asset, amount, safetyDeposit, timelock] = data as unknown[];
     if (typeof orderId !== "bigint") {
       return malformed(eventKind, "data_type_mismatch", "data[0] (order_id) is not bigint");
+    }
+    if (typeof asset !== "string") {
+      return malformed(eventKind, "data_type_mismatch", "data[1] (asset) is not a string");
     }
     if (typeof amount !== "bigint") {
       return malformed(eventKind, "data_type_mismatch", "data[2] (amount) is not bigint");
@@ -253,16 +256,25 @@ export function decodeHtlcEvent(
       return malformed(eventKind, "topic_type_mismatch", "topics[2] (hashlock) is not Bytes");
     }
     // data: [order_id, caller, preimage, amount, safety_deposit]
-    if (data.length < 3) {
+    if (data.length < 5) {
       return malformed(eventKind, "data_count_mismatch",
-        `expected ≥3 data elements, got ${data.length}`);
+        `expected ≥5 data elements, got ${data.length}`);
     }
-    const [orderId, , preimageRaw] = data as unknown[];
+    const [orderId, caller, preimageRaw, amount, safetyDeposit] = data as unknown[];
     if (typeof orderId !== "bigint") {
       return malformed(eventKind, "data_type_mismatch", "data[0] (order_id) is not bigint");
     }
+    if (typeof caller !== "string") {
+      return malformed(eventKind, "data_type_mismatch", "data[1] (caller) is not a string");
+    }
     if (!isBytes(preimageRaw)) {
       return malformed(eventKind, "data_type_mismatch", "data[2] (preimage) is not Bytes");
+    }
+    if (typeof amount !== "bigint") {
+      return malformed(eventKind, "data_type_mismatch", "data[3] (amount) is not bigint");
+    }
+    if (typeof safetyDeposit !== "bigint") {
+      return malformed(eventKind, "data_type_mismatch", "data[4] (safety_deposit) is not bigint");
     }
     return {
       schemaVersion: HTLC_EVENT_SCHEMA_VERSION,
@@ -288,13 +300,22 @@ export function decodeHtlcEvent(
     return malformed(eventKind, "topic_type_mismatch", "topics[2] (hashlock) is not Bytes");
   }
   // data: [order_id, caller, amount, safety_deposit]
-  if (data.length < 1) {
-    return malformed(eventKind, "data_count_mismatch",
-      `expected ≥1 data element, got ${data.length}`);
+  if (data.length < 4) {
+      return malformed(eventKind, "data_count_mismatch",
+        `expected ≥4 data elements, got ${data.length}`);
   }
-  const [orderId] = data as unknown[];
+  const [orderId, caller, amount, safetyDeposit] = data as unknown[];
   if (typeof orderId !== "bigint") {
-    return malformed(eventKind, "data_type_mismatch", "data[0] (order_id) is not bigint");
+      return malformed(eventKind, "data_type_mismatch", "data[0] (order_id) is not bigint");
+  }
+  if (typeof caller !== "string") {
+      return malformed(eventKind, "data_type_mismatch", "data[1] (caller) is not a string");
+  }
+  if (typeof amount !== "bigint") {
+      return malformed(eventKind, "data_type_mismatch", "data[2] (amount) is not bigint");
+  }
+  if (typeof safetyDeposit !== "bigint") {
+      return malformed(eventKind, "data_type_mismatch", "data[3] (safety_deposit) is not bigint");
   }
   return {
     schemaVersion: HTLC_EVENT_SCHEMA_VERSION,

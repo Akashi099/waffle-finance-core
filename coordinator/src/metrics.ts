@@ -55,6 +55,21 @@ export const dbQueryDuration = new Histogram({
   registers: [registry]
 });
 
+/** Repository transaction retries by operation */
+export const repositoryTransactionRetries = new Counter({
+  name: "coordinator_repository_transaction_retries_total",
+  help: "Number of repository transaction retries by operation",
+  labelNames: ["operation"] as const,
+  registers: [registry],
+});
+
+/** Repository transaction deadlocks */
+export const repositoryTransactionDeadlocks = new Counter({
+  name: "coordinator_repository_transaction_deadlocks_total",
+  help: "Number of repository transaction deadlocks detected",
+  registers: [registry],
+});
+
 /** Last block number seen by each listener */
 export const listenerLastBlock = new Gauge({
   name: "coordinator_listener_last_block",
