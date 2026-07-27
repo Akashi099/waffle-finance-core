@@ -131,7 +131,10 @@ e2e/                Cross-chain differential test harness
 
 The supported build, test, lint, and smoke-test entry points for every
 package are documented in [docs/COMMANDS.md](docs/COMMANDS.md) — start there
-to find the right command for the package you're touching.
+to find the right command for the package you're touching. New to the repo?
+Start with the [Contributor Handbook](docs/CONTRIBUTOR_HANDBOOK.md) instead —
+it maps package boundaries to validation checklists. For how the pieces fit
+together end to end, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 
@@ -181,6 +184,10 @@ See [`docs/DEPLOYMENT_ROLLBACK_RUNBOOK.md`](docs/DEPLOYMENT_ROLLBACK_RUNBOOK.md)
 See [`docs/RELEASE_CONTRACT.md`](docs/RELEASE_CONTRACT.md) for the typed build/release contract covering every package, including known gaps in local release verification.
 
 See [`docs/SMOKE_TEST_CONTRACT.md`](docs/SMOKE_TEST_CONTRACT.md) for the repo-wide smoke test contract spanning coordinator readiness, order announcement, SDK init, and the frontend entry point.
+
+See [`docs/RPC_DEGRADATION_TEST_MATRIX.md`](docs/RPC_DEGRADATION_TEST_MATRIX.md) for the deterministic multi-chain RPC degradation test matrix — proving the coordinator, relayer, and resolver degrade honestly under delayed, reset, and partial-receipt RPC conditions.
+
+See [`docs/PERFORMANCE_BASELINE.md`](docs/PERFORMANCE_BASELINE.md) for the measurable performance baseline covering order lookup, announcement, event replay, and stale-order cleanup.
 
 ---
 
