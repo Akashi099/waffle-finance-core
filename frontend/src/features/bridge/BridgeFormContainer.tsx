@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   Horizon,
   Asset,
@@ -27,22 +27,7 @@ import {
   buildFallbackRecord,
   type OrderSubmissionFailure,
 } from '../../lib/orderSubmissionFallback';
-import {
-  createQuote,
-  validateQuote,
-  serializeQuote,
-  clearPersistedQuote,
-  type BridgeQuote,
-  type SupportedChain,
-} from '../../lib/quoteModel';
-import {
-  createIdleState,
-  transition,
-  persistState as persistMachineState,
-  recoverState,
-  isSubmitting as machineIsSubmitting,
-  type SubmissionState,
-} from '../../lib/submissionStateMachine';
+import { useRouteDerivedValues } from '../../hooks/useRouteDerivedValues';
 
 export interface BridgeFormProps {
   ethAddress: string;
@@ -167,7 +152,16 @@ const saveTransactionToHistory = (transaction: {
     
     // Save back to localStorage
     localStorage.setItem('wafflefinance_transactions_v2', JSON.stringify(transactions));
-    
+
+    // Announce on the subscription contract so a mounted TransactionHistory
+    // reflects this immediately instead of waiting out its poll interval.
+    // The localStorage write above stays authoritative — the event is a
+    // notification, not the record.
+    //
+    // Built with the same adapter the poll path uses, so the two sources cannot
+    // disagree about which leg a hash belongs to.
+    publishOrderRow(historyTransaction);
+
     console.log('💾 Transaction saved to history:', historyTransaction);
   } catch (error) {
     console.error('❌ Failed to save transaction to history:', error);
@@ -215,6 +209,18 @@ const saveFallbackToHistory = (record: import('../../lib/orderSubmissionFallback
     if (transactions.length > 50) transactions.splice(50);
     localStorage.setItem('wafflefinance_transactions_v2', JSON.stringify(transactions));
 
+    // Failure notification on the contract. Published with the classified
+    // error rather than letting the payload builder synthesise a generic one,
+    // so the UI can show why this attempt failed and whether retrying helps.
+    publishLocalOrderStatus(record.id, 'failed', {
+      error: {
+        code: 'order_failed',
+        message: record.errorMessage,
+        retryable: false,
+      },
+      details: { direction: record.direction, errorCode: record.errorCode },
+    });
+
     console.log('💾 Fallback record saved to history:', historyEntry);
   } catch (err) {
     console.error('❌ Failed to save fallback record to history:', err);
@@ -239,7 +245,12 @@ const updateTransactionStatus = (orderId: string, status: 'pending' | 'completed
         
         // Save back to localStorage
         localStorage.setItem('wafflefinance_transactions_v2', JSON.stringify(transactions));
-        
+
+        // Progression notification. Publishing the merged row (rather than just
+        // the status) means any tx hashes that arrived alongside the transition
+        // travel with it through the same direction-aware mapping.
+        publishOrderRow(transactions[transactionIndex]);
+
         console.log(`💾 Transaction status updated: ${orderId} -> ${status}`);
       } else {
         console.log(`⚠️ Transaction not found for status update: ${orderId}`);
@@ -321,8 +332,6 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
       clearInterval(interval);
     };
   }, []);
-
-  const [estimatedAmount, setEstimatedAmount] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [orderCreated, setOrderCreated] = useState(false);
   const [orderId, setOrderId] = useState<string | null>(null);
@@ -380,13 +389,30 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
   const [exchangeRate, setExchangeRate] = useState<number>(ETH_TO_XLM_RATE);
   const [xlmUsdPrice, setXlmUsdPrice] = useState<number | null>(null);
   const [ethUsdPrice, setEthUsdPrice] = useState<number | null>(null);
+  const [solUsdPrice, setSolUsdPrice] = useState<number | null>(null);
   const [priceStateness, setPriceStaleness] = useState<'fresh' | 'stale' | 'fallback' | null>(null);
   const [isLoadingRate, setIsLoadingRate] = useState(false);
   const [rateLastUpdated, setRateLastUpdated] = useState<Date | null>(null);
-  
-  // Derive from/to tokens from direction map
-  const fromToken = DIRECTION_MAP[direction].from;
-  const toToken   = DIRECTION_MAP[direction].to;
+
+  // Memoized stable prices object — only reconstructed when individual prices change so that
+  // useRouteDerivedValues doesn't re-run the estimate computation on every render.
+  const prices = useMemo(
+    () => ({ ethUsd: ethUsdPrice, xlmUsd: xlmUsdPrice, solUsd: solUsdPrice }),
+    [ethUsdPrice, xlmUsdPrice, solUsdPrice],
+  );
+
+  // Stable, memoized derivations for the current route. Re-computes only when
+  // the actual underlying state (direction, addresses, amount, prices) changes,
+  // so rapid keystrokes and unrelated re-renders never cause unnecessary work.
+  const { fromToken, toToken, estimatedAmount, walletsReady: walletsConnected, unsupportedReasonsByRoute } =
+    useRouteDerivedValues({
+      direction,
+      amount,
+      ethAddress,
+      stellarAddress,
+      solanaAddress: solanaAddress ?? '',
+      prices,
+    });
 
   // Fetch balance when direction or addresses change
   useEffect(() => {
@@ -470,57 +496,14 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
     return () => { cancelled = true; };
   }, [direction, ethAddress, stellarAddress, solanaAddress, networkInfo.stellar.horizonUrl, networkInfo.isTestnet]);
   
-  // Fetch live prices from the relayer whenever the user is about to need a
-  // quote. The relayer caches CoinGecko responses for 60s, so a flurry of
-  // keystrokes ends up as at most one network round-trip per minute. We use a
-  // ref-less cancelled flag to discard responses for stale renders.
+  // Fetch live prices from the relayer on mount and whenever the selected
+  // direction changes. Prices are stored in state and the estimated output is
+  // derived synchronously via useRouteDerivedValues, so rapid keystrokes never
+  // trigger extra network round-trips. A 60-second interval keeps quotes fresh.
   useEffect(() => {
-    if (!amount || isNaN(parseFloat(amount))) {
-      setEstimatedAmount('');
-      return;
-    }
-
     let cancelled = false;
 
-    const computeWith = (
-      prices: { ethUsd: number; xlmUsd: number; solUsd: number },
-      staleness: 'fresh' | 'stale' | 'fallback',
-    ) => {
-      const inputAmount = parseFloat(amount);
-      const from = DIRECTION_MAP[direction].from.symbol;
-      const to   = DIRECTION_MAP[direction].to.symbol;
-
-      const usdOf = (sym: string) =>
-        sym === 'ETH' ? prices.ethUsd : sym === 'XLM' ? prices.xlmUsd : prices.solUsd;
-
-      const fromUsd = usdOf(from);
-      const toUsd   = usdOf(to);
-      if (!fromUsd || !toUsd) return;
-
-      const outputAmount = (inputAmount * fromUsd) / toUsd;
-      const decimals = to === 'ETH' || to === 'SOL' ? 6 : 2;
-      const estimatedTo = outputAmount.toFixed(decimals);
-      setEstimatedAmount(estimatedTo);
-
-      // Create a normalised, serializable quote that captures the current route
-      // and price. Submission validation will reject this quote if it expires
-      // or if the user switches chains before clicking Bridge.
-      const { srcChain, dstChain } = directionToChains(direction);
-      const quote = createQuote({
-        srcChain,
-        dstChain,
-        fromAsset: { chain: srcChain, symbol: from, decimals: DIRECTION_MAP[direction].from.decimals },
-        toAsset:   { chain: dstChain, symbol: to,   decimals: DIRECTION_MAP[direction].to.decimals   },
-        fromAmount: amount,
-        estimatedToAmount: estimatedTo,
-        exchangeRate: from === 'ETH' && to === 'XLM' ? prices.ethUsd / prices.xlmUsd : outputAmount / inputAmount,
-        priceStateness: staleness,
-      });
-      setActiveQuote(quote);
-      serializeQuote(quote);
-    };
-
-    const updateRateAndCalculate = async () => {
+    const fetchPrices = async () => {
       setIsLoadingRate(true);
 
       try {
@@ -531,7 +514,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
         const xlmPerEth = Number(body?.xlmPerEth);
         const ethUsd = Number(body?.ethUsd);
         const xlmUsd = Number(body?.xlmUsd);
-        const solUsd = Number(body?.solUsd) || 150; // fallback if not yet in API
+        const solUsd = Number(body?.solUsd) || 150;
 
         if (!Number.isFinite(xlmPerEth) || xlmPerEth <= 0 || !Number.isFinite(ethUsd) || ethUsd <= 0 || !Number.isFinite(xlmUsd) || xlmUsd <= 0) {
           throw new Error('prices endpoint returned malformed data');
@@ -542,30 +525,34 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
         setExchangeRate(xlmPerEth);
         setEthUsdPrice(ethUsd);
         setXlmUsdPrice(xlmUsd);
-        const resolvedStaleness = (body?.staleness as 'fresh' | 'stale' | 'fallback') ?? 'fresh';
-        setPriceStaleness(resolvedStaleness);
+        setSolUsdPrice(solUsd);
+        setPriceStaleness(body?.staleness ?? 'fresh');
         setRateLastUpdated(new Date(body?.fetchedAt ?? Date.now()));
-        computeWith({ ethUsd, xlmUsd, solUsd }, resolvedStaleness);
       } catch (err) {
         if (cancelled) return;
         console.warn('Falling back to hardcoded rate:', err);
         setExchangeRate(ETH_TO_XLM_RATE);
-        setEthUsdPrice(null);
-        setXlmUsdPrice(null);
+        setEthUsdPrice(3500);
+        setXlmUsdPrice(0.35);
+        setSolUsdPrice(150);
         setPriceStaleness('fallback');
         setRateLastUpdated(new Date());
-        computeWith({ ethUsd: 3500, xlmUsd: 0.35, solUsd: 150 }, 'fallback');
       } finally {
         if (!cancelled) setIsLoadingRate(false);
       }
     };
 
-    updateRateAndCalculate();
+    void fetchPrices();
+    const intervalId = window.setInterval(() => { void fetchPrices(); }, 60_000);
 
     return () => {
       cancelled = true;
+      window.clearInterval(intervalId);
     };
-  }, [amount, direction]);
+  // Prices are direction-independent — fetch once on mount then refresh on schedule.
+  // Rapid direction switches and amount changes never trigger extra network round-trips.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const solana = solanaAddress ?? '';
@@ -599,7 +586,6 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
       `${dropped.join(' and ')} wallet ${dropped.length > 1 ? 'connections' : 'connection'} lost. Reconnect to continue.`
     );
     setAmount('');
-    setEstimatedAmount('');
     setIsSubmitting(false);
     setValidationErrors({});
 
@@ -608,12 +594,11 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
     }
   }, [ethAddress, stellarAddress, solanaAddress, direction]);
 
-  const routeReady = routeWalletsReady(direction, ethAddress, stellarAddress, solanaAddress ?? '');
   useEffect(() => {
-    if (routeReady && recoveryNotice) {
+    if (walletsConnected && recoveryNotice) {
       setRecoveryNotice(null);
     }
-  }, [routeReady, recoveryNotice]);
+  }, [walletsConnected, recoveryNotice]);
   
   // Yön değiştirme — cycles ETH↔XLM, ETH↔SOL; Solana routes only if wallet connected
   const handleSwapDirection = () => {
@@ -623,11 +608,6 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
       return prev === 'eth_to_xlm' ? 'xlm_to_eth' : 'eth_to_xlm';
     });
     setAmount('');
-    setEstimatedAmount('');
-    // Invalidate the current quote — the new direction produces a different route
-    // so the existing quote cannot be applied to the reversed order.
-    setActiveQuote(null);
-    clearPersistedQuote();
   };
 
   // Form gönderimi - RELAYER API ÜZERİNDEN
@@ -1543,7 +1523,6 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
   // Form reset
   const handleReset = () => {
     setAmount('');
-    setEstimatedAmount('');
     setOrderCreated(false);
     setOrderId(null);
     setActiveQuote(null);
@@ -1554,13 +1533,11 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
     clearPersistedDraft();
   };
 
-  // Check if wallets are connected
   const isSolanaDirection =
     direction === 'eth_to_sol' ||
     direction === 'sol_to_eth' ||
     direction === 'xlm_to_sol' ||
     direction === 'sol_to_xlm';
-  const walletsConnected = routeWalletsReady(direction, ethAddress, stellarAddress, solanaAddress ?? '');
 
   return (
     <div className="w-full rounded-[1.25rem] p-4 swap-card-bg swap-card-border md:p-5 lg:p-6">
@@ -1603,11 +1580,17 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
         </div>
       ) : (
         <form onSubmit={handleSubmit} className="space-y-3">
-          {validationErrors.form && (
-            <div role="alert" className="rounded-2xl border border-red-400/40 bg-red-500/15 p-3 text-center text-sm text-red-200">
-              {validationErrors.form}
-            </div>
-          )}
+          {/* Always-present assertive live region for form-level errors. Screen readers watch the
+              stable node; the sr-only class hides it visually when empty. */}
+          <div
+            aria-live="assertive"
+            aria-atomic="true"
+            className={validationErrors.form
+              ? 'rounded-2xl border border-red-400/40 bg-red-500/15 p-3 text-center text-sm text-red-200'
+              : 'sr-only'}
+          >
+            {validationErrors.form ?? ''}
+          </div>
           <div className="mb-1 flex items-center justify-between">
             <div>
               <p className="text-xs uppercase tracking-[0.22em] text-cyan-100/55">Bridge console</p>
@@ -1623,7 +1606,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           </div>
 
           {/* Route selector */}
-          <div className="flex gap-1.5 rounded-xl border border-white/[0.06] bg-white/[0.03] p-1">
+          <div role="group" aria-label="Bridge route" className="flex gap-1.5 rounded-xl border border-white/[0.06] bg-white/[0.03] p-1">
             {ROUTE_OPTIONS.map((d) => {
               const labels: Record<string, string> = {
                 eth_to_xlm: 'ETH → XLM', xlm_to_eth: 'XLM → ETH',
@@ -1631,12 +1614,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
               };
               const isSol = d === 'eth_to_sol' || d === 'sol_to_eth';
               const active = direction === d;
-              const unsupportedReason = getUnsupportedRouteReason(
-                d,
-                ethAddress,
-                stellarAddress,
-                solanaAddress ?? ''
-              );
+              const unsupportedReason = unsupportedReasonsByRoute[d];
               const isDisabled = Boolean(unsupportedReason) && !active;
               return (
                 <button
@@ -1644,12 +1622,12 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
                   type="button"
                   disabled={isDisabled}
                   aria-disabled={isDisabled}
+                  aria-pressed={active}
                   title={unsupportedReason ?? undefined}
                   onClick={() => {
                     if (!unsupportedReason && direction !== d) {
                       setDirection(d);
                       setAmount('');
-                      setEstimatedAmount('');
                       setValidationErrors({});
                       setActiveQuote(null);
                       clearPersistedQuote();
@@ -1679,7 +1657,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
 
           {/* From Section */}
           <div>
-            <label className="mb-1.5 block text-xs font-semibold uppercase tracking-[0.16em] text-cyan-100/55">You pay</label>
+            <label htmlFor="bridge-amount-input" className="mb-1.5 block text-xs font-semibold uppercase tracking-[0.16em] text-cyan-100/55">You pay</label>
             <div className="token-input-panel rounded-2xl p-3 input-container">
               <div className="mb-2 flex items-center justify-between">
                 <div className="flex items-center gap-2">
@@ -1697,9 +1675,12 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
 
               <div className="flex items-center gap-2">
                 <input
+                  id="bridge-amount-input"
                   type="text"
                   inputMode="decimal"
                   autoComplete="off"
+                  aria-label="You pay"
+                  aria-describedby={validationErrors.amount ? 'bridge-amount-error' : undefined}
                   value={amount}
                   onChange={(e) => {
                     setAmount(sanitizeAmountInput(e.target.value, fromToken.decimals));
@@ -1743,7 +1724,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
                 </div>
               </div>
               {validationErrors.amount && (
-                <p className="mt-1 text-xs text-red-300">{validationErrors.amount}</p>
+                <p id="bridge-amount-error" className="mt-1 text-xs text-red-300" role="alert">{validationErrors.amount}</p>
               )}
             </div>
           </div>
@@ -1752,10 +1733,11 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           <div className="relative z-10 -my-2 flex justify-center">
             <button
               type="button"
+              aria-label="Swap direction"
               onClick={handleSwapDirection}
               className="button-hover-scale rounded-full border border-cyan-200/35 bg-[#081029] p-2.5 text-cyan-50 shadow-[0_14px_38px_rgba(0,0,0,0.4),0_0_24px_rgba(0,226,255,0.12)] transition hover:border-cyan-100/55 hover:bg-[#0d1735]"
             >
-              <ArrowDownUp className="h-5 w-5" />
+              <ArrowDownUp className="h-5 w-5" aria-hidden="true" />
             </button>
           </div>
 
@@ -1867,12 +1849,15 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
             </div>
           )}
 
-          {/* Status Message */}
-          {statusMessage && (
-            <div className="rounded-2xl border border-cyan-200/30 bg-cyan-200/[0.12] p-3 text-center">
-              <div className="font-medium text-cyan-100">{statusMessage}</div>
-            </div>
-          )}
+          {/* Status Message — always rendered with aria-live so screen readers hear every update */}
+          <div
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            className={statusMessage ? 'rounded-2xl border border-cyan-200/30 bg-cyan-200/[0.12] p-3 text-center' : 'sr-only'}
+          >
+            <div className="font-medium text-cyan-100">{statusMessage}</div>
+          </div>
           
           {/* Submit Button */}
           <button

@@ -256,6 +256,9 @@ Some migrations have Postgres-specific variants in `coordinator/migrations/`:
   instead of SQLite's table-recreate approach.
 - `006_stale_cleanup_postgres.sql` — uses `BIGINT` for the `archived_at`
   column instead of `INTEGER`, and `ADD COLUMN IF NOT EXISTS`.
+- `007_audit_log_postgres.sql` — uses `BIGSERIAL` for `audit_log.id` instead
+  of SQLite's `INTEGER PRIMARY KEY AUTOINCREMENT`, and `EXTRACT(EPOCH FROM
+  NOW())` instead of `strftime('%s','now')` for the `created_at` default.
 
 The migration runner falls back to the SQLite variant if a Postgres-specific
 file is not found, so adding a Postgres variant is always safe.

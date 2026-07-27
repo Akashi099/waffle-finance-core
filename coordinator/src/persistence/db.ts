@@ -225,7 +225,7 @@ export const CURRENT_SCHEMA_VERSION = "007_audit_log.sql";
  * DDL is already present in schema.sql — the record ensures the history table
  * reflects every logical change that has been applied.
  */
-const SQLITE_MIGRATIONS = [
+export const SQLITE_MIGRATIONS = [
   "001_initial.sql",
   "002_solana_support.sql",
   "003_secret_encryption.sql",
@@ -244,7 +244,7 @@ const SQLITE_MIGRATIONS = [
  * (e.g. `002_solana_support_postgres.sql`) replace the SQLite versions where
  * the DDL syntax differs.
  */
-const POSTGRES_MIGRATION_FILES = [
+export const POSTGRES_MIGRATION_FILES = [
   "001_initial.sql",
   "002_solana_support_postgres.sql",
   "003_secret_encryption.sql",

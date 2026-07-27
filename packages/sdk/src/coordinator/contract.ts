@@ -21,6 +21,7 @@
  */
 
 import type { Chain, Direction, OrderStatus } from "../types/index.js";
+import type { LiveRouteDirection } from "../routes/index.js";
 
 // ── Supported directions on the coordinator (subset of SDK Direction) ────────
 
@@ -29,8 +30,12 @@ import type { Chain, Direction, OrderStatus } from "../types/index.js";
  * `Direction` type contains two additional values (`xlm_to_sol`,
  * `sol_to_xlm`) that are not yet live on the backend; CoordinatorDirection
  * represents only what the API actually accepts.
+ *
+ * Defined as an alias of the route registry's live-direction union so the wire
+ * contract cannot drift from the registry: enabling a direction there widens
+ * this type in the same commit.
  */
-export type CoordinatorDirection = "eth_to_xlm" | "xlm_to_eth" | "eth_to_sol" | "sol_to_eth";
+export type CoordinatorDirection = LiveRouteDirection;
 
 // ── Wire shapes — responses ─────────────────────────────────────────────────
 

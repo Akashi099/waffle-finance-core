@@ -38,6 +38,8 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
     isStale,
     refreshFromCoordinator,
     updateTransactions,
+    streamError,
+    streamFailures,
   } = useTransactionHistoryCache({
     ethAddress,
     stellarAddress,
@@ -218,6 +220,18 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
           {(isRefreshing || isStale) && transactions.length > 0 && (
             <p className="mt-2 text-xs text-cyan-100/60" aria-live="polite">
               {isRefreshing ? 'Showing cached history while refreshing latest data...' : 'Showing cached history'}
+            </p>
+          )}
+          {/*
+            Distinct from the staleness line above. `isStale` means the data is
+            old; a stream error means we have temporarily lost the ability to
+            find out that it is old. The rows below stay exactly as they were,
+            so this says the updates paused, never that a swap went wrong.
+          */}
+          {streamError && (
+            <p className="mt-2 text-xs text-amber-200/70" aria-live="polite">
+              Live updates paused{streamFailures > 1 ? ` after ${streamFailures} failed attempts` : ''}.
+              Showing the last confirmed status for each swap. Retrying automatically.
             </p>
           )}
         </div>
