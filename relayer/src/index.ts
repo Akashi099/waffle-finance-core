@@ -191,11 +191,25 @@ import {
   logSupportPolicy,
   supportSummary,
 } from './support.js';
+import {
+  authorizeSettlementCommand,
+  checkOrderSettleable,
+  formatAuthorizationLog,
+  type SettlementAccountConfig,
+} from './settlement-permissions.js';
 import { assertSupportPolicy, SupportPolicyValidationError } from '@wafflefinance/config';
 import {
   solanaPlaceholderMode,
   settlementVerificationTotal,
   settlementProofReplaysTotal,
+  orderIngestionTotal,
+  orderQueueDepth,
+  relayDecisionTotal,
+  submissionLatencySeconds,
+  receiptLatencySeconds,
+  retryAttemptsHistogram,
+  droppedOrdersTotal,
+  chainDelayGauge,
 } from './metrics.js';
 
 // Contract addresses
@@ -530,6 +544,8 @@ async function initializeRelayer() {
     orderData: Record<string, unknown>
   ): Promise<void> => {
     activeOrders.set(orderId, orderData);
+    // Keep the queue-depth gauge current after every successful store.
+    orderQueueDepth.set(activeOrders.size);
     if (!needsChainMonitoring(activeOrders)) return;
     await ensureChainMonitoring();
     wakeChainPollers();
@@ -854,6 +870,13 @@ async function initializeRelayer() {
       // encoded, any secret generated, or any order stored — so an unsupported
       // chain, a contradictory chain/direction pair, or an asset class the
       // relayer cannot move is refused while nothing is at stake.
+
+      // ── Pipeline metric: ingestion ────────────────────────────────────
+      // Count every request that reaches the policy boundary (after basic
+      // HTTP parsing but before any business-logic check).
+      const ingestDirection = typeof direction === 'string' ? direction : 'unknown';
+      orderIngestionTotal.inc({ direction: ingestDirection });
+
       const routeDecision = decideOrderRoute(supportPolicy, {
         direction,
         fromChain,
@@ -861,6 +884,7 @@ async function initializeRelayer() {
         fromToken,
       });
       if (!routeDecision.supported) {
+        relayDecisionTotal.inc({ direction: ingestDirection, result: 'rejected_route' });
         console.warn(
           `🚫 Order rejected [${routeDecision.code}]: ${routeDecision.reason}`
         );
@@ -875,6 +899,48 @@ async function initializeRelayer() {
         `✅ Route ${routeDecision.from}→${routeDecision.to} ` +
         `(${routeDecision.tokenClass}) is supported`
       );
+
+      // ── Settlement-permission check ─────────────────────────────────────
+      //
+      // The route-capability check above confirmed the policy supports this
+      // chain pair. The settlement-permission check goes one level deeper: it
+      // verifies that BOTH the lock (source leg) and settle (destination leg)
+      // commands can actually execute — i.e. that the signing keys and contract
+      // addresses for each chain are present and non-placeholder.
+      //
+      // This catches a partially-configured deployment (e.g. Ethereum key
+      // present but Stellar secret missing) before any escrow is encoded,
+      // any secret generated, or any order stored.
+      const settlementDenial = checkOrderSettleable(
+        supportPolicy,
+        RELAYER_CONFIG as SettlementAccountConfig,
+        direction
+      );
+      if (settlementDenial) {
+        relayDecisionTotal.inc({ direction: ingestDirection, result: 'rejected_permissions' });
+        console.warn(
+          `🚫 Settlement permission denied [${settlementDenial.code}]: ${settlementDenial.reason}`
+        );
+        return res.status(403).json({
+          error: 'settlement_permission_denied',
+          code: settlementDenial.code,
+          details: settlementDenial.reason,
+          command: settlementDenial.command,
+          chain: settlementDenial.chain,
+        });
+      }
+      console.log(`✅ Settlement permissions granted for direction "${direction}"`);
+
+      // ── Pipeline metrics: accepted + queue depth + submission timer ──
+      relayDecisionTotal.inc({ direction: ingestDirection, result: 'accepted' });
+      // Start the submission latency timer — stopped when the response is
+      // sent so all branches (mock, testnet, mainnet, xlm-to-eth success/fail)
+      // are captured without needing individual stop calls in every branch.
+      const submissionTimer = submissionLatencySeconds.startTimer({ direction: ingestDirection });
+      res.on('finish', () => {
+        const result = res.statusCode < 400 ? 'success' : 'failure';
+        submissionTimer({ result });
+      });
 
       console.log('≡ƒîë Creating bridge order:', {
         direction,
@@ -1374,6 +1440,12 @@ async function initializeRelayer() {
         });
       }
 
+      // ── Pipeline metric: submission latency for the settlement path ───
+      const processSubmissionTimer = submissionLatencySeconds.startTimer({ direction: 'xlm_to_eth' });
+      res.on('finish', () => {
+        processSubmissionTimer({ result: res.statusCode < 400 ? 'success' : 'failure' });
+      });
+
       console.log('≡ƒîƒ Processing approved order:', { orderId, txHash, stellarTxHash });
       
       // Get stored order
@@ -1486,25 +1558,31 @@ async function initializeRelayer() {
 
           let processVerifiedPayment: Awaited<ReturnType<typeof verifyIncomingStellarPayment>>;
           try {
+            const receiptTimer = receiptLatencySeconds.startTimer();
             processVerifiedPayment = await verifyIncomingStellarPayment(stellarTxHash, {
               horizonUrl: processHorizonUrl,
               relayerPublicKey: processRelayerPubkey,
               expectedSourceAccount: userStellarAddress || undefined,
             });
+            receiptTimer({ result: 'success' });
             settlementVerificationTotal.inc({ result: 'success', network_mode: orderNetworkMode });
           } catch (verifyErr: unknown) {
             if (verifyErr instanceof StellarTxNotFoundError) {
+              receiptLatencySeconds.observe({ result: 'tx_not_found' }, 0);
               settlementVerificationTotal.inc({ result: 'tx_not_found', network_mode: orderNetworkMode });
               return res.status(404).json({ error: 'Stellar transaction not found on Horizon', stellarTxHash });
             }
             if (verifyErr instanceof StellarTxFailedError) {
+              receiptLatencySeconds.observe({ result: 'tx_failed' }, 0);
               settlementVerificationTotal.inc({ result: 'tx_failed', network_mode: orderNetworkMode });
               return res.status(400).json({ error: 'Stellar transaction failed on-chain', stellarTxHash });
             }
             if (verifyErr instanceof StellarPaymentMismatch) {
+              receiptLatencySeconds.observe({ result: 'payment_mismatch' }, 0);
               settlementVerificationTotal.inc({ result: 'payment_mismatch', network_mode: orderNetworkMode });
               return res.status(400).json({ error: 'Stellar payment verification failed', details: (verifyErr as Error).message, stellarTxHash });
             }
+            receiptLatencySeconds.observe({ result: 'horizon_error' }, 0);
             settlementVerificationTotal.inc({ result: 'horizon_error', network_mode: orderNetworkMode });
             return res.status(503).json({ error: 'Horizon verification temporarily unavailable' });
           }
@@ -1551,6 +1629,37 @@ async function initializeRelayer() {
             xlmStroops: procXlmStroops.toString(), exchangeRate: processExchangeRate,
             ethAmountWei: ethAmountWei.toString(), ethFormatted: ethers.formatEther(ethAmountWei),
           }) + '\n');
+
+          // ── Settlement-permission check (settle / ethereum) ──────────────
+          //
+          // Before building the provider or wallet, confirm the relayer is
+          // authorized to execute a `settle` command on Ethereum for this
+          // direction. This catches a missing key or factory address with a
+          // clear structured error rather than a cryptic ethers exception.
+          {
+            const procSettleAuth = authorizeSettlementCommand(
+              supportPolicy,
+              RELAYER_CONFIG as SettlementAccountConfig,
+              { command: 'settle', direction: storedOrder?.direction ?? 'xlm_to_eth', chain: 'ethereum' }
+            );
+            if (!procSettleAuth.authorized) {
+              console.warn(
+                `🚫 Settlement permission denied [${procSettleAuth.code}]: ${procSettleAuth.reason}`,
+                formatAuthorizationLog(procSettleAuth)
+              );
+              return res.status(403).json({
+                error: 'settlement_permission_denied',
+                code: procSettleAuth.code,
+                details: procSettleAuth.reason,
+                command: procSettleAuth.command,
+                chain: procSettleAuth.chain,
+              });
+            }
+            console.log(
+              '✅ Settlement permission granted (process)',
+              formatAuthorizationLog(procSettleAuth)
+            );
+          }
 
           // ── ETH provider + wallet ─────────────────────────────────────────
           const provider = new ethers.JsonRpcProvider(rpcUrl);
@@ -1624,6 +1733,8 @@ async function initializeRelayer() {
               throw txError;
             }
           }
+          // ── Retry histogram: eth_send ─────────────────────────────────────
+          retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'success' }, retryCount);
           console.log('≡ƒôñ ETH transaction sent:', ethTxResponse.hash);
           
           // Wait for confirmation with retry logic
@@ -1662,7 +1773,7 @@ async function initializeRelayer() {
           // Update order status
           storedOrder.status = 'completed';
           storedOrder.ethTxHash = ethTxReceipt?.hash;
-          
+
           // Success response
           res.json({
             success: true,
@@ -1686,6 +1797,9 @@ async function initializeRelayer() {
           
         } catch (ethError: any) {
           console.error('Γ¥î ETH transaction failed:', ethError);
+          // ── Pipeline metrics: fatal ETH send failure ──────────────────────
+          retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'failure' }, 3);
+          droppedOrdersTotal.inc({ direction: 'xlm_to_eth', reason: 'eth_tx_failed' });
           res.status(500).json({
             error: 'ETH release failed',
             details: ethError.message
@@ -1840,6 +1954,12 @@ async function initializeRelayer() {
       console.log('≡ƒöì DEBUG: Environment check - ETHEREUM_RPC_URL:', process.env.ETHEREUM_RPC_URL ? 'SET' : 'NOT SET');
       console.log('≡ƒöì DEBUG: Environment check - RELAYER_PRIVATE_KEY:', process.env.RELAYER_PRIVATE_KEY ? 'SET' : 'NOT SET');
       
+      // ── Pipeline metric: submission latency for xlm-to-eth ────────────
+      const xlmToEthTimer = submissionLatencySeconds.startTimer({ direction: 'xlm_to_eth' });
+      res.on('finish', () => {
+        xlmToEthTimer({ result: res.statusCode < 400 ? 'success' : 'failure' });
+      });
+
       const { orderId, stellarTxHash, stellarAddress, ethAddress, networkMode } = req.body;
       
       // Γ£à NETWORK DETECTION: Check request body first, then stored order, then default
@@ -1958,14 +2078,17 @@ async function initializeRelayer() {
 
       let verifiedPayment: Awaited<ReturnType<typeof verifyIncomingStellarPayment>>;
       try {
+        const receiptTimer = receiptLatencySeconds.startTimer();
         verifiedPayment = await verifyIncomingStellarPayment(stellarTxHash, {
           horizonUrl,
           relayerPublicKey,
           expectedSourceAccount: stellarAddress,
         });
+        receiptTimer({ result: 'success' });
         settlementVerificationTotal.inc({ result: 'success', network_mode: orderNetworkMode });
       } catch (verifyErr: unknown) {
         if (verifyErr instanceof StellarTxNotFoundError) {
+          receiptLatencySeconds.observe({ result: 'tx_not_found' }, 0);
           settlementVerificationTotal.inc({ result: 'tx_not_found', network_mode: orderNetworkMode });
           return res.status(404).json({
             error: 'Stellar transaction not found on Horizon',
@@ -1974,6 +2097,7 @@ async function initializeRelayer() {
           });
         }
         if (verifyErr instanceof StellarTxFailedError) {
+          receiptLatencySeconds.observe({ result: 'tx_failed' }, 0);
           settlementVerificationTotal.inc({ result: 'tx_failed', network_mode: orderNetworkMode });
           return res.status(400).json({
             error: 'Stellar transaction failed on-chain',
@@ -1982,6 +2106,7 @@ async function initializeRelayer() {
           });
         }
         if (verifyErr instanceof StellarPaymentMismatch) {
+          receiptLatencySeconds.observe({ result: 'payment_mismatch' }, 0);
           settlementVerificationTotal.inc({ result: 'payment_mismatch', network_mode: orderNetworkMode });
           return res.status(400).json({
             error: 'Stellar payment verification failed',
@@ -1989,6 +2114,7 @@ async function initializeRelayer() {
             stellarTxHash,
           });
         }
+        receiptLatencySeconds.observe({ result: 'horizon_error' }, 0);
         settlementVerificationTotal.inc({ result: 'horizon_error', network_mode: orderNetworkMode });
         return res.status(503).json({
           error: 'Horizon verification temporarily unavailable',
@@ -2019,7 +2145,37 @@ async function initializeRelayer() {
         console.log('≡ƒÆ░ REAL MODE: Sending actual ETH transaction');
         console.log('≡ƒöù RPC URL:', rpcUrl);
         console.log('≡ƒöæ Using relayer key: [REDACTED]');
-        
+
+        // ── Settlement-permission check (settle / ethereum) ───────────────
+        //
+        // We are about to release ETH to the beneficiary. Verify the settle
+        // command is authorized for this direction and that the Ethereum
+        // account (key + factory address) is ready before building the
+        // transaction, so a config regression is caught here with a clear
+        // error rather than a cryptic ethers exception mid-flight.
+        const settleAuth = authorizeSettlementCommand(
+          supportPolicy,
+          RELAYER_CONFIG as SettlementAccountConfig,
+          { command: 'settle', direction: storedOrder?.direction ?? 'xlm_to_eth', chain: 'ethereum' }
+        );
+        if (!settleAuth.authorized) {
+          console.warn(
+            `🚫 Settlement permission denied [${settleAuth.code}]: ${settleAuth.reason}`,
+            formatAuthorizationLog(settleAuth)
+          );
+          return res.status(403).json({
+            error: 'settlement_permission_denied',
+            code: settleAuth.code,
+            details: settleAuth.reason,
+            command: settleAuth.command,
+            chain: settleAuth.chain,
+          });
+        }
+        console.log(
+          '✅ Settlement permission granted',
+          formatAuthorizationLog(settleAuth)
+        );
+
         const provider = new ethers.JsonRpcProvider(rpcUrl);
         const relayerWallet = new ethers.Wallet(privateKey, provider);
         
@@ -2166,6 +2322,8 @@ async function initializeRelayer() {
             throw txError;
           }
         }
+        // ── Retry histogram: eth_send ─────────────────────────────────────
+        retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'success' }, txRetryCount);
         console.log('≡ƒôñ ETH transaction sent:', ethTxResponse.hash);
         console.log('≡ƒîÉ View on Etherscan: https://sepolia.etherscan.io/tx/' + ethTxResponse.hash);
         
@@ -2174,6 +2332,9 @@ async function initializeRelayer() {
           storedOrder.ethTxHash = ethTxResponse.hash;
         }
         
+        // ── Pipeline metrics: queue depth update after settlement ─────────
+        orderQueueDepth.set(activeOrders.size);
+
         res.json({
           success: true,
           orderId,
@@ -2255,6 +2416,10 @@ async function initializeRelayer() {
           refundError = relayerSecretKey ? 'Missing stellarAddress for refund' : `Relayer Stellar secret not configured for ${orderNetworkMode}`;
           console.error('❌ Cannot refund:', refundError);
         }
+
+        // ── Pipeline metrics: ETH send fatal failure (xlm-to-eth) ────────
+        retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'failure' }, txRetryCount ?? 0);
+        droppedOrdersTotal.inc({ direction: 'xlm_to_eth', reason: 'eth_tx_failed' });
 
         return res.status(500).json({
           error: 'ETH release failed',
