@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 //! WaffleFinance HTLC contract for Stellar (Soroban).
 //!
 //! This contract implements the Stellar side of the WaffleFinance cross-chain
@@ -66,6 +66,23 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error,
     symbol_short, token, vec, Address, Bytes, BytesN, Env, IntoVal, Symbol,
 };
+
+/// Asset class stored on each order so settlement paths, indexers, and
+/// future upgrade code can branch on asset type without re-deriving it.
+///
+/// - `Native` — the Stellar native XLM token (registered as the contract's
+///   known native token address via `set_native_token`).
+/// - `Token`  — any Soroban SAC or custom token contract.
+///
+/// Both classes settle through the same `token::Client` interface; the
+/// distinction exists for auditing, policy enforcement, and forward
+/// compatibility with future asset adapters.
+#[contracttype]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AssetClass {
+    Native = 0,
+    Token = 1,
+}
 
 #[cfg(test)]
 mod test;
@@ -208,6 +225,9 @@ pub enum Error {
     /// The requested operation is blocked because the contract is in
     /// maintenance mode.
     ContractInMaintenance = 18,
+    /// The asset address is not a valid or supported token contract.
+    /// Rejected before any transfer occurs.
+    InvalidAsset = 19,
 }
 
 /// Lifecycle state for a single HTLC order.
@@ -223,10 +243,23 @@ pub enum OrderStatus {
 }
 
 /// A single hash + time-locked order.
+///
+/// # Versioning
+///
+/// The `version` field is the on-chain schema marker for this order record.
+/// Readers that encounter `version == 0` are interacting with a pre-v1
+/// order (created before this field was added). Future contract upgrades
+/// that change the struct layout MUST increment `version` and handle
+/// earlier versions explicitly, keeping existing order IDs and external
+/// event consumers unaffected.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Order {
     pub id: u64,
+    /// Schema version of this order record (1 for orders created by this
+    /// contract revision). Allows future upgrades to detect and migrate
+    /// legacy records without breaking existing order IDs.
+    pub version: u32,
     /// Account that locked the funds (and paid the safety deposit).
     pub sender: Address,
     /// Account that can claim the funds by revealing the preimage.
@@ -236,6 +269,10 @@ pub struct Order {
     /// The asset locked. Use the native XLM asset contract here for
     /// native swaps; SAC and Soroban tokens are also supported.
     pub asset: Address,
+    /// Asset classification inferred at creation time. Stored so
+    /// settlement paths, indexers, and future upgrade code can branch
+    /// without re-deriving the class from the address.
+    pub asset_class: AssetClass,
     /// Amount of `asset` locked (in the asset's smallest unit).
     pub amount: i128,
     /// Safety deposit posted by the order creator. Goes to whoever
@@ -278,6 +315,10 @@ enum DataKey {
     MinSafetyDeposit,
     /// Current operational mode. Absent means Live (backward compat).
     ContractMode,
+    /// Address of the native XLM token contract. When set, orders whose
+    /// `asset` matches this address are classified as `AssetClass::Native`;
+    /// all others are `AssetClass::Token`.
+    NativeToken,
 }
 
 /// Events emitted by the contract. Topics are short symbols so they fit
@@ -514,6 +555,12 @@ impl HtlcContract {
         sender.require_auth();
         Self::require_create_claim_allowed(&env);
 
+        // Reject the HTLC contract's own address as an asset: transferring
+        // from the contract to itself would silently succeed but leave
+        // tokens stranded with no external balance change.
+        if asset == env.current_contract_address() {
+            panic_with_error!(&env, Error::InvalidAsset);
+        }
         if amount <= 0 {
             panic_with_error!(&env, Error::InvalidAmount);
         }
@@ -569,20 +616,34 @@ impl HtlcContract {
             .instance()
             .set(&DataKey::NextOrderId, &(order_id + 1));
 
-        // Pull the locked amount + safety deposit from sender to the
-        // contract address. token::Client honours sender.require_auth().
-        let token_client = token::Client::new(&env, &asset);
+        // Classify the asset before any transfer so validation happens
+        // before value moves.
+        let native_token: Option<Address> = env.storage().instance().get(&DataKey::NativeToken);
+        let asset_class = match native_token.as_ref() {
+            Some(n) if n == &asset => AssetClass::Native,
+            _ => AssetClass::Token,
+        };
+
+        // Overflow-protected total: checked_add fires Error::Overflow
+        // before any token transfer, preventing locked funds being split
+        // across an overflow boundary.
         let total = amount
             .checked_add(safety_deposit)
             .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
-        token_client.transfer(&sender, &env.current_contract_address(), &total);
+
+        // Single canonical settlement path: all asset classes route through
+        // settle_transfer so there is exactly one transfer site per direction.
+        // token::Client honours sender.require_auth().
+        Self::settle_transfer(&env, &asset, &sender, &env.current_contract_address(), total);
 
         let order = Order {
             id: order_id,
+            version: 1,
             sender: sender.clone(),
             beneficiary: beneficiary.clone(),
             refund_address: refund_address.clone(),
             asset: asset.clone(),
+            asset_class,
             amount,
             safety_deposit,
             hashlock: hashlock.clone(),
@@ -639,20 +700,12 @@ impl HtlcContract {
             panic_with_error!(&env, Error::InvalidPreimage);
         }
 
-        let token_client = token::Client::new(&env, &order.asset);
+        // Canonical settlement: all asset classes route through settle_transfer.
         // Locked amount goes to beneficiary.
-        token_client.transfer(
-            &env.current_contract_address(),
-            &order.beneficiary,
-            &order.amount,
-        );
+        Self::settle_transfer(&env, &order.asset, &env.current_contract_address(), &order.beneficiary, order.amount);
         // Safety deposit goes to whoever submitted the claim tx.
         if order.safety_deposit > 0 {
-            token_client.transfer(
-                &env.current_contract_address(),
-                &caller,
-                &order.safety_deposit,
-            );
+            Self::settle_transfer(&env, &order.asset, &env.current_contract_address(), &caller, order.safety_deposit);
         }
 
         order.status = OrderStatus::Claimed;
@@ -694,18 +747,10 @@ impl HtlcContract {
             panic_with_error!(&env, Error::NotExpired);
         }
 
-        let token_client = token::Client::new(&env, &order.asset);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &order.refund_address,
-            &order.amount,
-        );
+        // Canonical settlement: all asset classes route through settle_transfer.
+        Self::settle_transfer(&env, &order.asset, &env.current_contract_address(), &order.refund_address, order.amount);
         if order.safety_deposit > 0 {
-            token_client.transfer(
-                &env.current_contract_address(),
-                &caller,
-                &order.safety_deposit,
-            );
+            Self::settle_transfer(&env, &order.asset, &env.current_contract_address(), &caller, order.safety_deposit);
         }
 
         order.status = OrderStatus::Refunded;
@@ -794,6 +839,28 @@ impl HtlcContract {
         env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
+    /// Register the native XLM token contract address. Orders whose `asset`
+    /// matches this address are classified as `AssetClass::Native`; all
+    /// others remain `AssetClass::Token`. Pass `None` semantics by calling
+    /// `clear_native_token`.
+    pub fn set_native_token(env: Env, native: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::NativeToken, &native);
+        Self::extend_instance_ttl(&env);
+    }
+
+    /// Remove the native token binding (all future orders are classified
+    /// as `AssetClass::Token`).
+    pub fn clear_native_token(env: Env) {
+        Self::require_admin(&env);
+        env.storage().instance().remove(&DataKey::NativeToken);
+        Self::extend_instance_ttl(&env);
+    }
+
+    pub fn native_token(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::NativeToken)
+    }
+
     // ---------------------------------------------------------------------
     // Internal helpers
     // ---------------------------------------------------------------------
@@ -867,6 +934,17 @@ impl HtlcContract {
         if mode == ContractMode::Paused {
             panic_with_error!(env, Error::ContractPaused);
         }
+    }
+
+    /// Canonical single-path settlement helper.
+    ///
+    /// All token movements (create, claim, refund) route through this
+    /// function so there is exactly one transfer call site per direction.
+    /// Both `AssetClass::Native` and `AssetClass::Token` use `token::Client`
+    /// because Soroban's native XLM token contract exposes the same
+    /// SEP-41 interface as any other SAC.
+    fn settle_transfer(env: &Env, asset: &Address, from: &Address, to: &Address, amount: i128) {
+        token::Client::new(env, asset).transfer(from, to, &amount);
     }
 }
 
