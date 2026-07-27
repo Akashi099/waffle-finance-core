@@ -289,6 +289,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "lifecycle"
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "registered_at"
                       },
                       "val": {
