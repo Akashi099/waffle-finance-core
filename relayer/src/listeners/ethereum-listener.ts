@@ -7,19 +7,12 @@ import { ethers, Contract, EventLog } from 'ethers';
 import { RELAYER_CONFIG } from '../index.js';
 import { startAdaptivePoll, type AdaptivePollHandle } from '../utils/adaptive-poll.js';
 import { sanitizeForLog } from '../utils/sanitize-for-log.js';
-
-// Mock CrossChainOrder interface for now
-interface CrossChainOrder {
-  orderId: string;
-  sender: string;
-  token: string;
-  amount: string;
-  hashLock: string;
-  timelock: number;
-  feeRate: string;
-  partialFillEnabled: boolean;
-  ethereumOrderId?: string;
-}
+import {
+  createEthOrderCreatedEvent,
+  createEthOrderClaimedEvent,
+  createEthOrderRefundedEvent,
+  type NormalizedRelayEvent,
+} from '../events/relay-event.js';
 
 // HTLCBridge contract ABI (focusing on OrderCreated event)
 const HTLC_BRIDGE_ABI = [
@@ -27,6 +20,9 @@ const HTLC_BRIDGE_ABI = [
   "event OrderClaimed(uint256 indexed orderId, address indexed claimer, uint256 amount, uint256 totalFilled, bytes32 preimage)",
   "event OrderRefunded(uint256 indexed orderId, address indexed sender, uint256 refundAmount)"
 ];
+
+/** Relay event handler registered via `setRelayEventHandler`. */
+export type RelayEventHandler = (event: NormalizedRelayEvent) => void | Promise<void>;
 
 /**
  * Ethereum OrderCreated event data
@@ -70,9 +66,31 @@ export class EthereumEventListener {
   private isPolling: boolean = false;
   private isActiveFn: () => boolean = () => true;
   private isAttentiveFn: () => boolean = () => true;
+  /** Downstream handler for normalized relay events. */
+  private relayEventHandler: RelayEventHandler | null = null;
 
   constructor() {
     // Lazy initialization - will be done in startListening()
+  }
+
+  /** Register a handler that receives every normalized relay event this listener emits. */
+  setRelayEventHandler(handler: RelayEventHandler): void {
+    this.relayEventHandler = handler;
+  }
+
+  /** Dispatch a normalized event to the registered handler (fire-and-forget). */
+  private dispatchRelayEvent(event: NormalizedRelayEvent): void {
+    if (!this.relayEventHandler) return;
+    try {
+      const result = this.relayEventHandler(event);
+      if (result instanceof Promise) {
+        result.catch((err: unknown) =>
+          console.warn('[eth-listener] relay event handler error:', sanitizeForLog(err))
+        );
+      }
+    } catch (err) {
+      console.warn('[eth-listener] relay event handler threw synchronously:', sanitizeForLog(err));
+    }
   }
 
   /** Wire idle/active gating before `startListening()`. */
@@ -227,7 +245,10 @@ export class EthereumEventListener {
   }
 
   /**
-   * Handle OrderCreated event from HTLCBridge contract
+   * Handle OrderCreated event from HTLCBridge contract.
+   *
+   * Emits a `NormalizedRelayEvent` via the registered handler so downstream
+   * relay logic is decoupled from raw Ethereum event shapes.
    */
   private async handleOrderCreatedEvent(
     orderId: bigint,
@@ -241,37 +262,28 @@ export class EthereumEventListener {
     event: EventLog
   ): Promise<void> {
     try {
-      console.log(`\n🚨 orderId=${orderId.toString()} NEW ETHEREUM ORDER DETECTED!`);
-      console.log('================================');
-      console.log(`🆔 orderId=${orderId.toString()} Order ID: ${orderId.toString()}`);
-      console.log(`👤 Sender: ${sender}`);
-      console.log(`💰 Token: ${token}`);
-      console.log(`💵 Amount: ${ethers.formatUnits(amount.toString(), 18)} tokens`);
-      console.log(`🔒 Hash Lock: ${hashLock}`);
-      console.log(`⏰ Timelock: ${new Date(Number(timelock) * 1000).toISOString()}`);
-      console.log(`💸 Fee Rate: ${Number(feeRate) / 100}%`);
-      console.log(`🔄 Partial Fill: ${partialFillEnabled ? 'Enabled' : 'Disabled'}`);
-      console.log(`📝 Tx Hash: ${event.transactionHash}`);
-      console.log(`🧱 Block: ${event.blockNumber}`);
+      const orderIdStr = orderId.toString();
+      console.log(`[eth-listener] OrderCreated orderId=${orderIdStr} block=${event.blockNumber} tx=${event.transactionHash}`);
 
-      // Convert Ethereum event to CrossChainOrder format
-      const crossChainOrder: CrossChainOrder = {
-        orderId: orderId.toString(),
-        ethereumOrderId: orderId.toString(),
-        token: token,
-        amount: amount.toString(),
-        hashLock: hashLock,
+      const normalizedEvent = createEthOrderCreatedEvent({
+        orderId: orderIdStr,
+        txHash: event.transactionHash,
+        blockNumber: event.blockNumber,
+        hashlock: hashLock,
         timelock: Number(timelock),
-        sender: sender,
-        partialFillEnabled: partialFillEnabled,
-        feeRate: feeRate.toString()
-      };
+        amount: amount.toString(),
+        tokenAddress: token,
+        feeRateBps: Number(feeRate),
+        partialFillEnabled,
+      });
 
-      // Process the order (create Stellar HTLC)
-      await this.processCrossChainOrder(crossChainOrder);
+      this.dispatchRelayEvent(normalizedEvent);
+
+      // v1 Stellar HTLC path is disabled — see processCrossChainOrder comment.
+      this.processCrossChainOrder({ orderId: orderIdStr, hashLock });
 
     } catch (error) {
-      console.error(`❌ orderId=${orderId.toString()} Error handling OrderCreated event:`, sanitizeForLog(error));
+      console.error(`[eth-listener] error handling OrderCreated orderId=${orderId.toString()}:`, sanitizeForLog(error));
     }
   }
 
@@ -285,15 +297,11 @@ export class EthereumEventListener {
    * the user's own claim/refund handle settlement, rather than logging
    * fake success messages.
    */
-  private async processCrossChainOrder(order: CrossChainOrder): Promise<void> {
-    console.log(`🌉 orderId=${order.ethereumOrderId} OrderCreated observed on Ethereum:`, {
-      ethereumOrderId: order.ethereumOrderId,
-      hashLock: order.hashLock
-    });
+  private processCrossChainOrder(order: { orderId: string; hashLock: string }): void {
+    console.log(`[eth-listener] OrderCreated observed on Ethereum orderId=${order.orderId} hashlock=${order.hashLock}`);
     console.log(
-      `⚠️  orderId=${order.ethereumOrderId} v1 placeholder Stellar HTLC path disabled. The v2 coordinator (Phase 4) ` +
-      'creates the Soroban HTLC. Until then the user can refund permissionlessly ' +
-      'after the timelock.'
+      `[eth-listener] v1 placeholder Stellar HTLC path disabled. The v2 coordinator (Phase 4) ` +
+      'creates the Soroban HTLC. Until then the user can refund permissionlessly after the timelock.'
     );
   }
 
