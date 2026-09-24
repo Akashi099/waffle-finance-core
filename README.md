@@ -296,4 +296,4 @@ Full reference in [`env.example`](env.example).
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See `LICENSE` (file not yet committed to the repository).
